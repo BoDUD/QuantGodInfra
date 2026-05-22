@@ -140,6 +140,9 @@ def render_env(paths: dict[str, Path]) -> str:
         "QG_LEGACY_DAILY_AUTOPILOT_ENABLED": "0",
         "QG_AGENT_V25_INTERVAL_SECONDS": "300",
         "QG_AGENT_V25_SEND_TELEGRAM": "1",
+        "QG_AGENT_V25_TELEGRAM_TIMEOUT_SECONDS": "60",
+        "QG_AGENT_V25_FAST_TELEGRAM_GATEWAY": "0",
+        "QG_AGENT_V25_HEAVY_TELEGRAM_GATEWAY": "1",
         "QG_AGENT_OPS_HEALTH_ENABLED": "1",
         "QG_PRODUCTION_BURN_IN_ENABLED": "1",
         "QG_PRODUCTION_BURN_IN_INTERVAL_SECONDS": "300",
@@ -209,6 +212,7 @@ load_env_file "${QG_BACKEND_ROOT}/.env.local"
 load_env_file "${QG_BACKEND_ROOT}/.env.telegram.local"
 load_env_file "${QG_BACKEND_ROOT}/.env.deepseek.local"
 
+export PYTHONPATH="${QG_BACKEND_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p "__LOG_DIR__"
 '''
 
