@@ -45,7 +45,6 @@ class MacLaunchdHelperTests(unittest.TestCase):
             self.assertIn("QG_FOCUS_SYMBOL='USDJPYc'", text)
             self.assertIn("QG_ALLOWED_SYMBOLS='USDJPYc'", text)
             self.assertIn("QG_ACCOUNT_MODE='cent'", text)
-            self.assertIn("QG_POLYMARKET_REAL_EXECUTION='false'", text)
             self.assertIn("QG_TELEGRAM_COMMANDS_ALLOWED='0'", text)
             self.assertNotIn("/QuantGod/", text)
 

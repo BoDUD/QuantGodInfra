@@ -163,6 +163,5 @@ Infra may start processes and synchronize static assets. It must not:
 - Write MT5 live trading decisions.
 - Store Telegram, DeepSeek, broker, wallet, or private-key secrets in Git.
 - Add Telegram command execution.
-- Add Polymarket wallet execution.
 - Mutate live preset risk settings.
 - Convert optional Cloudflare tooling into a required runtime dependency.
