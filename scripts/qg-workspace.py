@@ -120,6 +120,82 @@ def assert_workspace_paths(paths: dict[str, pathlib.Path]) -> None:
             fail(f"{name} repo path is not a directory: {path}")
 
 
+def normalize_remote_url(url: str) -> str:
+    text = str(url or "").strip()
+    if text.startswith("git@github.com:"):
+        text = "https://github.com/" + text.removeprefix("git@github.com:")
+    if text.endswith(".git"):
+        text = text[:-4]
+    return text.rstrip("/")
+
+
+def repo_name_from_url(url: str) -> str:
+    normalized = normalize_remote_url(url)
+    marker = "github.com/"
+    if marker not in normalized:
+        return ""
+    return normalized.split(marker, 1)[1]
+
+
+def git_origin_url(repo: pathlib.Path) -> str:
+    proc = subprocess.run(
+        ["git", "config", "--get", "remote.origin.url"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def manifest_remote_issues(manifest_path: pathlib.Path, actual_urls: dict[str, str]) -> list[str]:
+    if not manifest_path.exists() or not actual_urls:
+        return []
+    manifest = read_json(manifest_path)
+    issues: list[str] = []
+    repos = manifest.get("repos")
+    linked_repos = manifest.get("linkedRepos")
+    if isinstance(repos, dict):
+        for key, actual_url in actual_urls.items():
+            entry = repos.get(key)
+            if not isinstance(entry, dict):
+                issues.append(f"{manifest_path}: missing repos.{key}")
+                continue
+            manifest_url = normalize_remote_url(str(entry.get("url", "")))
+            if manifest_url != actual_url:
+                issues.append(f"{manifest_path}: repos.{key}.url={manifest_url or 'MISSING'} != {actual_url}")
+            actual_name = repo_name_from_url(actual_url)
+            manifest_name = str(entry.get("name", "")).strip()
+            if actual_name and manifest_name != actual_name:
+                issues.append(f"{manifest_path}: repos.{key}.name={manifest_name or 'MISSING'} != {actual_name}")
+        return issues
+    if isinstance(linked_repos, dict):
+        for key, actual_url in actual_urls.items():
+            manifest_url = normalize_remote_url(str(linked_repos.get(key, "")))
+            if manifest_url != actual_url:
+                issues.append(f"{manifest_path}: linkedRepos.{key}={manifest_url or 'MISSING'} != {actual_url}")
+    return issues
+
+
+def check_manifest_remotes(paths: dict[str, pathlib.Path]) -> None:
+    actual_urls: dict[str, str] = {}
+    for key, path in paths.items():
+        origin = normalize_remote_url(git_origin_url(path))
+        if origin:
+            actual_urls[key] = origin
+    if not actual_urls:
+        return
+    issues: list[str] = []
+    for path in paths.values():
+        issues.extend(manifest_remote_issues(path / "repo-manifest.json", actual_urls))
+    if issues:
+        for issue in issues:
+            print(f"FAIL: {issue}")
+        fail("workspace manifest remote verification failed")
+    print("OK: workspace repo manifests match local origin remotes")
+
+
 def cmd_status(ws: dict[str, Any]) -> None:
     for name, path in repo_paths(ws).items():
         print(f"\n== {name}: {path}")
@@ -264,6 +340,7 @@ def cmd_verify(ws: dict[str, Any]) -> None:
 
     if failed:
         fail("workspace verification failed")
+    check_manifest_remotes(paths)
     split_guard = paths["infra"] / "scripts" / "qg-split-path-guard.py"
     if split_guard.exists():
         run(["python3", str(split_guard), "--root", str(paths["infra"].parent)], paths["infra"])

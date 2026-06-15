@@ -173,6 +173,55 @@ class WorkspaceHelperTest(unittest.TestCase):
 
             run_mock.assert_called_once_with(["python3", str(split_guard), "--root", str(root)], infra)
 
+    def test_manifest_remote_issues_accept_current_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = pathlib.Path(tmp) / "repo-manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "repos": {
+                            "backend": {
+                                "name": "BoDUD/QuantGodBackend",
+                                "url": "https://github.com/BoDUD/QuantGodBackend.git",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            issues = qgw.manifest_remote_issues(
+                manifest,
+                {"backend": "https://github.com/BoDUD/QuantGodBackend"},
+            )
+
+            self.assertEqual([], issues)
+
+    def test_manifest_remote_issues_reject_owner_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = pathlib.Path(tmp) / "repo-manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "repos": {
+                            "backend": {
+                                "name": "Boowenn/QuantGodBackend",
+                                "url": "https://github.com/Boowenn/QuantGodBackend",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            issues = qgw.manifest_remote_issues(
+                manifest,
+                {"backend": "https://github.com/BoDUD/QuantGodBackend"},
+            )
+
+            self.assertTrue(any("repos.backend.url" in issue for issue in issues))
+            self.assertTrue(any("repos.backend.name" in issue for issue in issues))
+
 
 if __name__ == "__main__":
     unittest.main()

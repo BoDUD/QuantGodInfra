@@ -4,27 +4,27 @@
   "generatedAtIso": "2026-05-02T07:24:43.280360+00:00",
   "repos": {
     "backend": {
-      "name": "Boowenn/QuantGodBackend",
+      "name": "BoDUD/QuantGodBackend",
       "path": "../QuantGodBackend",
-      "url": "https://github.com/Boowenn/QuantGodBackend",
+      "url": "https://github.com/BoDUD/QuantGodBackend",
       "role": "MT5/MQL5 engine, Node API, Python tools, tests"
     },
     "frontend": {
-      "name": "Boowenn/QuantGodFrontend",
+      "name": "BoDUD/QuantGodFrontend",
       "path": "../QuantGodFrontend",
-      "url": "https://github.com/Boowenn/QuantGodFrontend",
+      "url": "https://github.com/BoDUD/QuantGodFrontend",
       "role": "Vue operator workbench"
     },
     "infra": {
-      "name": "Boowenn/QuantGodInfra",
+      "name": "BoDUD/QuantGodInfra",
       "path": ".",
-      "url": "https://github.com/Boowenn/QuantGodInfra",
+      "url": "https://github.com/BoDUD/QuantGodInfra",
       "role": "workspace automation, Cloudflare, deployment sync"
     },
     "docs": {
-      "name": "Boowenn/QuantGodDocs",
+      "name": "BoDUD/QuantGodDocs",
       "path": "../QuantGodDocs",
-      "url": "https://github.com/Boowenn/QuantGodDocs",
+      "url": "https://github.com/BoDUD/QuantGodDocs",
       "role": "canonical Markdown documentation hub"
     }
   },
