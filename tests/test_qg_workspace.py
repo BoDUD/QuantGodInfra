@@ -222,6 +222,88 @@ class WorkspaceHelperTest(unittest.TestCase):
             self.assertTrue(any("repos.backend.url" in issue for issue in issues))
             self.assertTrue(any("repos.backend.name" in issue for issue in issues))
 
+    def test_active_dirty_issues_reports_workspace_dirty_state(self) -> None:
+        paths = {
+            "backend": pathlib.Path("/tmp/QuantGodBackend"),
+            "frontend": pathlib.Path("/tmp/QuantGodFrontend"),
+        }
+
+        def fake_status(repo: pathlib.Path) -> list[str]:
+            if repo.name == "QuantGodBackend":
+                return [" M tools/example.py"]
+            return []
+
+        with mock.patch.object(qgw, "git_status_porcelain", side_effect=fake_status):
+            issues = qgw.active_dirty_issues(paths)
+
+        self.assertEqual(1, len(issues))
+        self.assertIn("backend repo has uncommitted changes", issues[0])
+        self.assertIn("tools/example.py", issues[0])
+
+    def test_tracked_local_tool_files_filters_codex_paths(self) -> None:
+        with mock.patch.object(
+            qgw,
+            "git_lines",
+            return_value=[
+                ".codex/skills/quantgod-trading-agent/SKILL.md",
+                "tools/normal.py",
+            ],
+        ):
+            tracked = qgw.tracked_local_tool_files(pathlib.Path("/tmp/QuantGodBackend"))
+
+        self.assertEqual([".codex/skills/quantgod-trading-agent/SKILL.md"], tracked)
+
+    def test_legacy_safety_issues_detect_non_rsi_live_residue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = pathlib.Path(tmp) / "QuantGod"
+            preset = legacy / qgw.LEGACY_PRESET
+            policy = legacy / qgw.LEGACY_POLICY_BUILDER
+            preset.parent.mkdir(parents=True)
+            policy.parent.mkdir(parents=True)
+            preset.write_text(
+                "\n".join(
+                    [
+                        "EnablePilotMA=true",
+                        "EnablePilotBBH1Live=true",
+                        "EnableNonRsiLegacyLiveAuthorization=true",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            policy.write_text(
+                'LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal", "MA_Cross", "USDJPY_NIGHT_REVERSION_SAFE"}\n',
+                encoding="utf-8",
+            )
+
+            issues = qgw.legacy_safety_issues(legacy)
+
+        self.assertTrue(any("MA_Cross live switch" in issue for issue in issues))
+        self.assertTrue(any("non-RSI legacy live authorization" in issue for issue in issues))
+        self.assertTrue(any("live eligibility includes non-RSI" in issue for issue in issues))
+
+    def test_legacy_safety_issues_accept_rsi_only_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = pathlib.Path(tmp) / "QuantGod"
+            preset = legacy / qgw.LEGACY_PRESET
+            policy = legacy / qgw.LEGACY_POLICY_BUILDER
+            preset.parent.mkdir(parents=True)
+            policy.parent.mkdir(parents=True)
+            preset.write_text(
+                "\n".join(
+                    [
+                        "EnablePilotMA=false",
+                        "EnablePilotBBH1Live=false",
+                        "EnableNonRsiLegacyLiveAuthorization=false",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            policy.write_text('LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal"}\n', encoding="utf-8")
+
+            issues = qgw.legacy_safety_issues(legacy)
+
+        self.assertEqual([], issues)
+
 
 if __name__ == "__main__":
     unittest.main()

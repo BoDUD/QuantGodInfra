@@ -26,6 +26,10 @@ from typing import Any
 
 REPO_KEYS = ("backend", "frontend", "infra", "docs")
 DEFAULT_WORKSPACE = "workspace/quantgod.workspace.json"
+LEGACY_REPO_NAME = "QuantGod"
+LOCAL_TOOL_PREFIXES = (".codex/",)
+LEGACY_PRESET = "MQL5/Presets/QuantGod_MT5_HFM_LivePilot.set"
+LEGACY_POLICY_BUILDER = "tools/usdjpy_strategy_lab/policy_builder.py"
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -149,6 +153,27 @@ def git_origin_url(repo: pathlib.Path) -> str:
     return proc.stdout.strip()
 
 
+def git_lines(repo: pathlib.Path, args: Sequence[str]) -> list[str]:
+    proc = subprocess.run(
+        ["git", *[str(part) for part in args]],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    return [line for line in proc.stdout.splitlines() if line.strip()]
+
+
+def git_status_porcelain(repo: pathlib.Path) -> list[str]:
+    return git_lines(repo, ["status", "--porcelain"])
+
+
+def tracked_local_tool_files(repo: pathlib.Path) -> list[str]:
+    tracked = git_lines(repo, ["ls-files", *LOCAL_TOOL_PREFIXES])
+    return [path for path in tracked if any(path.startswith(prefix) for prefix in LOCAL_TOOL_PREFIXES)]
+
+
 def manifest_remote_issues(manifest_path: pathlib.Path, actual_urls: dict[str, str]) -> list[str]:
     if not manifest_path.exists() or not actual_urls:
         return []
@@ -196,13 +221,124 @@ def check_manifest_remotes(paths: dict[str, pathlib.Path]) -> None:
     print("OK: workspace repo manifests match local origin remotes")
 
 
+def active_dirty_issues(paths: dict[str, pathlib.Path]) -> list[str]:
+    issues: list[str] = []
+    for name, path in paths.items():
+        dirty = git_status_porcelain(path)
+        if dirty:
+            sample = ", ".join(dirty[:8])
+            suffix = "" if len(dirty) <= 8 else f", ... +{len(dirty) - 8}"
+            issues.append(f"{name} repo has uncommitted changes: {sample}{suffix}")
+    return issues
+
+
+def check_active_repos_clean(paths: dict[str, pathlib.Path]) -> None:
+    issues = active_dirty_issues(paths)
+    if issues:
+        for issue in issues:
+            print(f"FAIL: {issue}")
+        fail("active workspace repositories must be clean before verify passes")
+    print("OK: active workspace repositories are clean")
+
+
+def check_tracked_local_tools(paths: dict[str, pathlib.Path]) -> None:
+    issues: list[str] = []
+    for name, path in paths.items():
+        tracked = tracked_local_tool_files(path)
+        if tracked:
+            sample = ", ".join(tracked[:8])
+            suffix = "" if len(tracked) <= 8 else f", ... +{len(tracked) - 8}"
+            issues.append(f"{name} repo tracks local Codex/tool files: {sample}{suffix}")
+    if issues:
+        for issue in issues:
+            print(f"FAIL: {issue}")
+        fail("workspace contains tracked local tool files")
+    print("OK: no active repo tracks .codex local tool files")
+
+
+def legacy_repo_path(ws: dict[str, Any], paths: dict[str, pathlib.Path]) -> pathlib.Path:
+    raw = str(ws.get("legacy") or ws.get("legacyMonorepo") or "").strip()
+    if raw:
+        path = pathlib.Path(raw).expanduser()
+        if path.is_absolute():
+            return path.resolve()
+        return (workspace_root(ws) / path).resolve()
+    return (paths["infra"].parent / LEGACY_REPO_NAME).resolve()
+
+
+def legacy_safety_issues(legacy: pathlib.Path) -> list[str]:
+    issues: list[str] = []
+    preset = legacy / LEGACY_PRESET
+    if preset.exists():
+        text = preset.read_text(encoding="utf-8", errors="ignore")
+        unsafe_markers = {
+            "EnableNonRsiLegacyLiveAuthorization=true": "non-RSI legacy live authorization is enabled",
+            "EnablePilotMA=true": "MA_Cross live switch is enabled in legacy preset",
+            "EnablePilotBBH1Live=true": "BB_Triple live switch is enabled in legacy preset",
+            "EnablePilotMacdH1Live=true": "MACD_Divergence live switch is enabled in legacy preset",
+            "EnablePilotSRM15Live=true": "SR_Breakout live switch is enabled in legacy preset",
+        }
+        for marker, message in unsafe_markers.items():
+            if marker in text:
+                issues.append(f"{preset}: {message}")
+
+    policy = legacy / LEGACY_POLICY_BUILDER
+    if policy.exists():
+        text = policy.read_text(encoding="utf-8", errors="ignore")
+        if "LIVE_ELIGIBLE_STRATEGIES" in text and ("MA_Cross" in text or "USDJPY_NIGHT_REVERSION_SAFE" in text):
+            issues.append(f"{policy}: live eligibility includes non-RSI strategy names")
+        if 'LIVE_ELIGIBLE_STRATEGY = "RSI_Reversal"' not in text and 'LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal"}' not in text:
+            issues.append(f"{policy}: live eligibility is not locked to RSI_Reversal only")
+    return issues
+
+
+def print_legacy_status(ws: dict[str, Any], paths: dict[str, pathlib.Path]) -> None:
+    legacy = legacy_repo_path(ws, paths)
+    print(f"\n== legacy quarantine: {legacy}")
+    if not legacy.exists():
+        print("OK: legacy QuantGod monorepo not present")
+        return
+    print("QUARANTINE: legacy QuantGod is not an active workspace repo")
+    origin = normalize_remote_url(git_origin_url(legacy))
+    if origin:
+        print(f"remote.origin={origin}")
+    dirty = git_status_porcelain(legacy)
+    if dirty:
+        print("dirty:")
+        for line in dirty[:12]:
+            print(f"  {line}")
+        if len(dirty) > 12:
+            print(f"  ... +{len(dirty) - 12}")
+    issues = legacy_safety_issues(legacy)
+    if issues:
+        print("unsafe legacy markers:")
+        for issue in issues:
+            print(f"  {issue}")
+
+
+def check_legacy_quarantine(ws: dict[str, Any], paths: dict[str, pathlib.Path]) -> None:
+    legacy = legacy_repo_path(ws, paths)
+    if not legacy.exists():
+        print("OK: legacy QuantGod monorepo absent")
+        return
+    print(f"WARN: legacy QuantGod monorepo present and quarantined :: {legacy}")
+    issues = legacy_safety_issues(legacy)
+    if issues:
+        for issue in issues:
+            print(f"FAIL: {issue}")
+        fail("legacy QuantGod quarantine has unsafe live eligibility residue")
+    print("OK: legacy QuantGod quarantine has no unsafe non-RSI live markers")
+
+
 def cmd_status(ws: dict[str, Any]) -> None:
-    for name, path in repo_paths(ws).items():
+    paths = repo_paths(ws)
+    for name, path in paths.items():
         print(f"\n== {name}: {path}")
         if not path.exists():
             print("MISSING")
             continue
         run(["git", "status", "--short", "--branch"], path, check=False)
+    print_legacy_status(ws, paths)
 
 
 def cmd_pull(ws: dict[str, Any]) -> None:
@@ -340,6 +476,9 @@ def cmd_verify(ws: dict[str, Any]) -> None:
 
     if failed:
         fail("workspace verification failed")
+    check_active_repos_clean(paths)
+    check_tracked_local_tools(paths)
+    check_legacy_quarantine(ws, paths)
     check_manifest_remotes(paths)
     split_guard = paths["infra"] / "scripts" / "qg-split-path-guard.py"
     if split_guard.exists():
