@@ -391,6 +391,36 @@ def run_docs_checks(docs: pathlib.Path) -> None:
         print(f"skip docs link check: {docs_check} not found")
 
 
+def run_docs_api_contract_strict(docs: pathlib.Path, backend: pathlib.Path) -> None:
+    contract_check = docs / "scripts" / "check_api_contract_matches_backend.py"
+    contract = docs / "docs" / "contracts" / "api-contract.json"
+    if not contract_check.exists() or not contract.exists():
+        print(f"skip docs API contract strict check: {contract_check} or {contract} not found")
+        return
+    run(
+        [
+            sys.executable,
+            str(contract_check),
+            "--contract",
+            str(contract),
+            "--backend",
+            str(backend),
+            "--strict-extra",
+            "--min-endpoints",
+            "100",
+        ],
+        docs,
+    )
+
+
+def run_backend_runtime_integrity_verify(backend: pathlib.Path) -> None:
+    runtime_integrity = backend / "tools" / "run_runtime_evidence_integrity.py"
+    if not runtime_integrity.exists():
+        print(f"skip backend runtime evidence integrity verify: {runtime_integrity} not found")
+        return
+    run([sys.executable, str(runtime_integrity), "--runtime-dir", "./runtime", "verify"], backend)
+
+
 def cmd_test(ws: dict[str, Any]) -> None:
     """Run the cross-repo smoke test suite.
 
@@ -480,6 +510,8 @@ def cmd_verify(ws: dict[str, Any]) -> None:
     check_tracked_local_tools(paths)
     check_legacy_quarantine(ws, paths)
     check_manifest_remotes(paths)
+    run_docs_api_contract_strict(paths["docs"], paths["backend"])
+    run_backend_runtime_integrity_verify(paths["backend"])
     split_guard = paths["infra"] / "scripts" / "qg-split-path-guard.py"
     if split_guard.exists():
         run(["python3", str(split_guard), "--root", str(paths["infra"].parent)], paths["infra"])

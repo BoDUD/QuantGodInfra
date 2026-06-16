@@ -60,6 +60,8 @@ python3 scripts/qg-workspace.py --workspace workspace/quantgod.workspace.json cl
 
 It does not modify MT5 live presets, credentials, wallet state, or trading configuration.
 
+`verify` is the read-only cross-repo acceptance gate. In addition to split-repo boundaries, it runs the Docs strict API contract check against Backend with `--strict-extra --min-endpoints 100`, then verifies Backend core runtime evidence integrity with `tools/run_runtime_evidence_integrity.py --runtime-dir ./runtime verify`. It does not write MT5 order request/receipt files, mutate live presets, or enable broker execution.
+
 ## macOS LaunchAgents
 
 Install local background services:

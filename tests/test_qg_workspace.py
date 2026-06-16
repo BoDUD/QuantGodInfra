@@ -173,6 +173,45 @@ class WorkspaceHelperTest(unittest.TestCase):
 
             run_mock.assert_called_once_with(["python3", str(split_guard), "--root", str(root)], infra)
 
+    def test_cmd_verify_runs_contract_and_runtime_integrity_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp).resolve()
+            backend = root / "QuantGodBackend"
+            frontend = root / "QuantGodFrontend"
+            infra = root / "QuantGodInfra"
+            docs = root / "QuantGodDocs"
+            (backend / "tools").mkdir(parents=True)
+            (backend / "MQL5").mkdir()
+            (backend / "tools" / "run_runtime_evidence_integrity.py").write_text("", encoding="utf-8")
+            (frontend / "src").mkdir(parents=True)
+            (infra / "scripts").mkdir(parents=True)
+            (infra / "scripts" / "qg-workspace.py").write_text("", encoding="utf-8")
+            (docs / "docs" / "architecture").mkdir(parents=True)
+            (docs / "docs" / "architecture" / "repo-split.md").write_text("ok", encoding="utf-8")
+            (docs / "scripts").mkdir(parents=True)
+            (docs / "scripts" / "check_api_contract_matches_backend.py").write_text("", encoding="utf-8")
+            (docs / "docs" / "contracts").mkdir(parents=True)
+            (docs / "docs" / "contracts" / "api-contract.json").write_text("{}", encoding="utf-8")
+            ws = {
+                "backend": str(backend),
+                "frontend": str(frontend),
+                "infra": str(infra),
+                "docs": str(docs),
+            }
+
+            with mock.patch.object(qgw, "run") as run_mock:
+                qgw.cmd_verify(ws)
+
+            calls = [call.args for call in run_mock.call_args_list]
+            contract_call = next(args for args in calls if "check_api_contract_matches_backend.py" in str(args[0]))
+            integrity_call = next(args for args in calls if "run_runtime_evidence_integrity.py" in str(args[0]))
+            contract_command = [str(part) for part in contract_call[0]]
+            integrity_command = [str(part) for part in integrity_call[0]]
+            self.assertIn("--strict-extra", contract_command)
+            self.assertIn("--min-endpoints", contract_command)
+            self.assertIn("100", contract_command)
+            self.assertEqual(integrity_command[-2:], ["./runtime", "verify"])
+
     def test_manifest_remote_issues_accept_current_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manifest = pathlib.Path(tmp) / "repo-manifest.json"
