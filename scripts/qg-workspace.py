@@ -30,6 +30,31 @@ LEGACY_REPO_NAME = "QuantGod"
 LOCAL_TOOL_PREFIXES = (".codex/",)
 LEGACY_PRESET = "MQL5/Presets/QuantGod_MT5_HFM_LivePilot.set"
 LEGACY_POLICY_BUILDER = "tools/usdjpy_strategy_lab/policy_builder.py"
+COMMON_LOCAL_IGNORE_PATTERNS = (
+    ".codex/",
+    ".DS_Store",
+    ".env",
+    ".env.*",
+    "*.log",
+    "__pycache__/",
+    "*.pyc",
+    "runtime/",
+    "exports/",
+    "cache/",
+    ".cache/",
+)
+REPO_LOCAL_IGNORE_PATTERNS = {
+    "backend": (
+        "Dashboard/vue-dist/",
+        "Dashboard/QuantGod_*.json",
+        "Dashboard/QuantGod_*.csv",
+        "archive/backtests/runs/",
+        "archive/param-lab/runs/",
+    ),
+    "frontend": ("dist/", ".vite/", "coverage/"),
+    "infra": ("workspace/*.local.json", ".wrangler/"),
+    "docs": (),
+}
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -172,6 +197,46 @@ def git_status_porcelain(repo: pathlib.Path) -> list[str]:
 def tracked_local_tool_files(repo: pathlib.Path) -> list[str]:
     tracked = git_lines(repo, ["ls-files", *LOCAL_TOOL_PREFIXES])
     return [path for path in tracked if any(path.startswith(prefix) for prefix in LOCAL_TOOL_PREFIXES)]
+
+
+def is_git_repo(repo: pathlib.Path) -> bool:
+    return (repo / ".git").exists()
+
+
+def _ignore_patterns(repo: pathlib.Path) -> set[str]:
+    gitignore = repo / ".gitignore"
+    if not gitignore.exists():
+        return set()
+    patterns: set[str] = set()
+    for raw in gitignore.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("!"):
+            continue
+        patterns.add(line)
+    return patterns
+
+
+def local_artifact_ignore_issues(paths: dict[str, pathlib.Path]) -> list[str]:
+    issues: list[str] = []
+    for name, path in paths.items():
+        if not is_git_repo(path):
+            continue
+        patterns = _ignore_patterns(path)
+        required = set(COMMON_LOCAL_IGNORE_PATTERNS)
+        required.update(REPO_LOCAL_IGNORE_PATTERNS.get(name, ()))
+        missing = sorted(pattern for pattern in required if pattern not in patterns)
+        if missing:
+            issues.append(f"{name} repo .gitignore missing local artifact patterns: {', '.join(missing)}")
+    return issues
+
+
+def check_local_artifact_ignores(paths: dict[str, pathlib.Path]) -> None:
+    issues = local_artifact_ignore_issues(paths)
+    if issues:
+        for issue in issues:
+            print(f"FAIL: {issue}")
+        fail("workspace local artifact ignore policy failed")
+    print("OK: active repo .gitignore files cover local artifacts")
 
 
 def manifest_remote_issues(manifest_path: pathlib.Path, actual_urls: dict[str, str]) -> list[str]:
@@ -508,6 +573,7 @@ def cmd_verify(ws: dict[str, Any]) -> None:
         fail("workspace verification failed")
     check_active_repos_clean(paths)
     check_tracked_local_tools(paths)
+    check_local_artifact_ignores(paths)
     check_legacy_quarantine(ws, paths)
     check_manifest_remotes(paths)
     run_docs_api_contract_strict(paths["docs"], paths["backend"])

@@ -292,6 +292,38 @@ class WorkspaceHelperTest(unittest.TestCase):
 
         self.assertEqual([".codex/skills/quantgod-trading-agent/SKILL.md"], tracked)
 
+    def test_local_artifact_ignore_issues_report_missing_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            backend = root / "QuantGodBackend"
+            backend.mkdir()
+            (backend / ".git").mkdir()
+            (backend / ".gitignore").write_text(".env\n*.log\n", encoding="utf-8")
+
+            issues = qgw.local_artifact_ignore_issues({"backend": backend})
+
+        self.assertEqual(1, len(issues))
+        self.assertIn("backend repo .gitignore missing local artifact patterns", issues[0])
+        self.assertIn(".codex/", issues[0])
+        self.assertIn("runtime/", issues[0])
+        self.assertIn("exports/", issues[0])
+
+    def test_local_artifact_ignore_issues_accept_required_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            frontend = root / "QuantGodFrontend"
+            frontend.mkdir()
+            (frontend / ".git").mkdir()
+            patterns = [
+                *qgw.COMMON_LOCAL_IGNORE_PATTERNS,
+                *qgw.REPO_LOCAL_IGNORE_PATTERNS["frontend"],
+            ]
+            (frontend / ".gitignore").write_text("\n".join(patterns) + "\n", encoding="utf-8")
+
+            issues = qgw.local_artifact_ignore_issues({"frontend": frontend})
+
+        self.assertEqual([], issues)
+
     def test_legacy_safety_issues_detect_non_rsi_live_residue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             legacy = pathlib.Path(tmp) / "QuantGod"

@@ -8,5 +8,11 @@ node_modules/
 *.log
 __pycache__/
 *.pyc
+.DS_Store
+.codex/
+runtime/
+exports/
+cache/
+.cache/
 workspace/quantgod.workspace.json
 workspace/*.local.json
