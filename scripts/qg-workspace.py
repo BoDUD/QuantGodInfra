@@ -539,7 +539,10 @@ def cmd_closed_loop(ws: dict[str, Any]) -> None:
     run_docs_checks(paths["docs"])
     split_guard = paths["infra"] / "scripts" / "qg-split-path-guard.py"
     if split_guard.exists():
-        run(["python3", str(split_guard), "--root", str(paths["infra"].parent)], paths["infra"])
+        run(
+            ["python3", str(split_guard), "--root", str(paths["infra"].parent), "--include-codex-automations"],
+            paths["infra"],
+        )
     print("QG_WORKSPACE_CLOSED_LOOP_OK")
 
 
@@ -580,7 +583,10 @@ def cmd_verify(ws: dict[str, Any]) -> None:
     run_backend_runtime_integrity_verify(paths["backend"])
     split_guard = paths["infra"] / "scripts" / "qg-split-path-guard.py"
     if split_guard.exists():
-        run(["python3", str(split_guard), "--root", str(paths["infra"].parent)], paths["infra"])
+        run(
+            ["python3", str(split_guard), "--root", str(paths["infra"].parent), "--include-codex-automations"],
+            paths["infra"],
+        )
     print("QG_WORKSPACE_VERIFY_OK")
 
 

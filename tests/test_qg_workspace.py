@@ -171,7 +171,10 @@ class WorkspaceHelperTest(unittest.TestCase):
             with mock.patch.object(qgw, "run") as run_mock:
                 qgw.cmd_verify(ws)
 
-            run_mock.assert_called_once_with(["python3", str(split_guard), "--root", str(root)], infra)
+            run_mock.assert_called_once_with(
+                ["python3", str(split_guard), "--root", str(root), "--include-codex-automations"],
+                infra,
+            )
 
     def test_cmd_verify_runs_contract_and_runtime_integrity_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
