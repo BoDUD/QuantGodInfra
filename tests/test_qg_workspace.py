@@ -50,6 +50,38 @@ class WorkspaceHelperTest(unittest.TestCase):
             self.assertEqual(paths["infra"], root / "QuantGodInfra")
             self.assertEqual(paths["docs"], root / "QuantGodDocs")
 
+    def test_default_workspace_falls_back_to_script_root_when_run_from_workspace_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp).resolve()
+            infra = root / "QuantGodInfra"
+            workspace_dir = infra / "workspace"
+            workspace_dir.mkdir(parents=True)
+            config_path = workspace_dir / "quantgod.workspace.json"
+            config_path.write_text("{}", encoding="utf-8")
+
+            resolved = qgw.resolve_workspace_path(
+                qgw.DEFAULT_WORKSPACE,
+                cwd=root,
+                script_root=infra,
+            )
+
+            self.assertEqual(resolved, config_path)
+
+    def test_explicit_workspace_path_stays_relative_to_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp).resolve()
+            infra = root / "QuantGodInfra"
+            (infra / "workspace").mkdir(parents=True)
+            explicit = "missing/custom.workspace.json"
+
+            resolved = qgw.resolve_workspace_path(
+                explicit,
+                cwd=root,
+                script_root=infra,
+            )
+
+            self.assertEqual(resolved, root / explicit)
+
     def test_backend_node_tests_are_enumerated_and_hard_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             backend = pathlib.Path(tmp) / "QuantGodBackend"

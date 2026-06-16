@@ -57,6 +57,34 @@ REPO_LOCAL_IGNORE_PATTERNS = {
 }
 
 
+def infra_root() -> pathlib.Path:
+    return pathlib.Path(__file__).resolve().parents[1]
+
+
+def resolve_workspace_path(
+    raw_workspace: str,
+    *,
+    cwd: pathlib.Path | None = None,
+    script_root: pathlib.Path | None = None,
+) -> pathlib.Path:
+    """Resolve workspace config from cwd, with a script-local default fallback."""
+
+    raw_path = pathlib.Path(str(raw_workspace)).expanduser()
+    if raw_path.is_absolute():
+        return raw_path
+
+    cwd = pathlib.Path.cwd() if cwd is None else pathlib.Path(cwd)
+    cwd_candidate = cwd / raw_path
+    if cwd_candidate.exists() or str(raw_workspace) != DEFAULT_WORKSPACE:
+        return cwd_candidate
+
+    root = infra_root() if script_root is None else pathlib.Path(script_root)
+    script_candidate = root / raw_path
+    if script_candidate.exists():
+        return script_candidate
+    return cwd_candidate
+
+
 def fail(message: str, code: int = 1) -> None:
     print(f"QG_WORKSPACE_FAIL: {message}", file=sys.stderr)
     raise SystemExit(code)
@@ -602,7 +630,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    ws = load_workspace(pathlib.Path(args.workspace))
+    ws = load_workspace(resolve_workspace_path(args.workspace))
     {
         "status": cmd_status,
         "pull": cmd_pull,
