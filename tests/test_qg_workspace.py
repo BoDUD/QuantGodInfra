@@ -219,6 +219,10 @@ class WorkspaceHelperTest(unittest.TestCase):
             (backend / "MQL5").mkdir()
             (backend / "tools" / "run_runtime_evidence_integrity.py").write_text("", encoding="utf-8")
             (frontend / "src").mkdir(parents=True)
+            (frontend / "package.json").write_text(
+                json.dumps({"scripts": {"contract": "node scripts/frontend_api_contract_guard.mjs"}}),
+                encoding="utf-8",
+            )
             (infra / "scripts").mkdir(parents=True)
             (infra / "scripts" / "qg-workspace.py").write_text("", encoding="utf-8")
             (docs / "docs" / "architecture").mkdir(parents=True)
@@ -261,8 +265,10 @@ class WorkspaceHelperTest(unittest.TestCase):
                 qgw.cmd_verify(ws)
 
             calls = [call.args for call in run_mock.call_args_list]
+            frontend_contract_call = next(args for args in calls if args[0] == ["npm", "run", "contract"])
             contract_call = next(args for args in calls if "check_api_contract_matches_backend.py" in str(args[0]))
             integrity_call = capture_mock.call_args.args
+            self.assertEqual(frontend_contract_call[1], frontend)
             contract_command = [str(part) for part in contract_call[0]]
             integrity_command = [str(part) for part in integrity_call[0]]
             self.assertIn("--strict-extra", contract_command)

@@ -535,6 +535,18 @@ def run_frontend_quality(frontend: pathlib.Path) -> None:
             run(["npm", "run", script_name], frontend)
 
 
+def run_frontend_contract_guard(frontend: pathlib.Path) -> None:
+    """Run the lightweight frontend/API contract guard during workspace verify."""
+
+    if not (frontend / "package.json").exists():
+        print(f"skip frontend contract guard: package.json not found in {frontend}")
+        return
+    if not has_npm_script(frontend, "contract"):
+        print("skip frontend contract guard: package.json does not define scripts.contract")
+        return
+    run(["npm", "run", "contract"], frontend)
+
+
 def run_docs_checks(docs: pathlib.Path) -> None:
     docs_check = docs / "scripts" / "check_docs_links.py"
     if docs_check.exists():
@@ -793,6 +805,7 @@ def cmd_verify(ws: dict[str, Any]) -> None:
     check_active_backend_live_lane(paths["backend"])
     check_legacy_quarantine(ws, paths)
     check_manifest_remotes(paths)
+    run_frontend_contract_guard(paths["frontend"])
     run_docs_api_contract_strict(paths["docs"], paths["backend"])
     run_backend_runtime_integrity_verify(paths["backend"])
     split_guard = paths["infra"] / "scripts" / "qg-split-path-guard.py"
