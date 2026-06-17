@@ -552,6 +552,14 @@ def runtime_recovery_label(row: dict[str, Any]) -> str:
     return str(row.get("kind") or row.get("artifactId") or "recovery")
 
 
+def runtime_recovery_command(row: dict[str, Any]) -> str:
+    for key in ("collectionCommand", "refreshCommand", "caseMemoryBuildCommand", "verifyCommand"):
+        value = _short_text(row.get(key), 220)
+        if value:
+            return value
+    return ""
+
+
 def runtime_integrity_summary_lines(payload: dict[str, Any], *, recovery_limit: int = 7) -> list[str]:
     status = str(payload.get("status") or "UNKNOWN")
     gate = str(payload.get("promotionGateStatus") or "UNKNOWN")
@@ -586,6 +594,9 @@ def runtime_integrity_summary_lines(payload: dict[str, Any], *, recovery_limit: 
             if action:
                 detail += f" :: {action}"
             lines.append(detail)
+            command = runtime_recovery_command(row)
+            if command:
+                lines.append(f"      command: {command}")
         hidden = len(queue) - min(len(queue), recovery_limit)
         if hidden > 0:
             lines.append(f"    ... {hidden} more recovery rows")

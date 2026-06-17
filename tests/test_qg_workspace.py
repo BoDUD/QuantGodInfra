@@ -246,6 +246,7 @@ class WorkspaceHelperTest(unittest.TestCase):
                             "status": "FRESHNESS_STALE",
                             "priority": "HIGH",
                             "nextActionZh": "刷新 M1 history freshness。",
+                            "refreshCommand": "python3 tools/run_usdjpy_strategy_backtest.py --runtime-dir ./runtime sync-klines --months 12 --timeframes M1,M5,M15,H1",
                         }
                     ],
                 }
@@ -284,6 +285,7 @@ class WorkspaceHelperTest(unittest.TestCase):
                     "status": "FRESHNESS_STALE",
                     "priority": "HIGH",
                     "nextActionZh": "M1 覆盖和密度已满足，但 latestLagHours 超过阈值。",
+                    "refreshCommand": "python3 tools/run_usdjpy_strategy_backtest.py --runtime-dir ./runtime sync-klines --months 12 --timeframes M1,M5,M15,H1",
                 },
                 {
                     "kind": "case_memory_category",
@@ -291,6 +293,9 @@ class WorkspaceHelperTest(unittest.TestCase):
                     "status": "MISSING_CATEGORY",
                     "priority": "HIGH",
                     "nextActionZh": "收集高分影子机会被挡住后继续走盈利方向的样本。",
+                    "collectionCommand": "python3 tools/run_usdjpy_bar_replay.py --runtime-dir ./runtime entry --write",
+                    "caseMemoryBuildCommand": "python3 tools/run_case_memory.py --runtime-dir ./runtime build --write --limit 8",
+                    "verifyCommand": "python3 tools/run_runtime_evidence_integrity.py --runtime-dir ./runtime verify",
                 },
             ],
             "nextActionZh": "核心证据完整，但 promotion gate 仍阻断晋级。",
@@ -305,6 +310,8 @@ class WorkspaceHelperTest(unittest.TestCase):
         self.assertIn("recoveryQueue=2", text)
         self.assertIn("history:M1", text)
         self.assertIn("case:MISSED_OPPORTUNITY", text)
+        self.assertIn("command: python3 tools/run_usdjpy_strategy_backtest.py", text)
+        self.assertIn("command: python3 tools/run_usdjpy_bar_replay.py", text)
         self.assertNotIn('"artifacts"', text)
 
     def test_manifest_remote_issues_accept_current_owner(self) -> None:
