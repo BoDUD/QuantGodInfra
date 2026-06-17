@@ -234,18 +234,78 @@ class WorkspaceHelperTest(unittest.TestCase):
                 "docs": str(docs),
             }
 
-            with mock.patch.object(qgw, "run") as run_mock:
+            runtime_payload = json.dumps(
+                {
+                    "status": "PASS",
+                    "promotionGateStatus": "BLOCKED",
+                    "promotionBlockers": ["historyProductionStatus:M1:freshness_not_ok"],
+                    "promotionRecoveryQueue": [
+                        {
+                            "kind": "history_freshness",
+                            "timeframe": "M1",
+                            "status": "FRESHNESS_STALE",
+                            "priority": "HIGH",
+                            "nextActionZh": "刷新 M1 history freshness。",
+                        }
+                    ],
+                }
+            )
+            runtime_result = mock.Mock(stdout=runtime_payload, returncode=0)
+
+            with mock.patch.object(qgw, "run") as run_mock, mock.patch.object(
+                qgw,
+                "run_capture",
+                return_value=runtime_result,
+            ) as capture_mock:
                 qgw.cmd_verify(ws)
 
             calls = [call.args for call in run_mock.call_args_list]
             contract_call = next(args for args in calls if "check_api_contract_matches_backend.py" in str(args[0]))
-            integrity_call = next(args for args in calls if "run_runtime_evidence_integrity.py" in str(args[0]))
+            integrity_call = capture_mock.call_args.args
             contract_command = [str(part) for part in contract_call[0]]
             integrity_command = [str(part) for part in integrity_call[0]]
             self.assertIn("--strict-extra", contract_command)
             self.assertIn("--min-endpoints", contract_command)
             self.assertIn("100", contract_command)
             self.assertEqual(integrity_command[-2:], ["./runtime", "verify"])
+
+    def test_runtime_integrity_summary_lines_compact_success_payload(self) -> None:
+        payload = {
+            "status": "PASS",
+            "promotionGateStatus": "BLOCKED",
+            "promotionBlockers": [
+                "historyProductionStatus:M1:freshness_not_ok",
+                "caseMemoryArtifactManifest:missing_category:MISSED_OPPORTUNITY",
+            ],
+            "promotionRecoveryQueue": [
+                {
+                    "kind": "history_freshness",
+                    "timeframe": "M1",
+                    "status": "FRESHNESS_STALE",
+                    "priority": "HIGH",
+                    "nextActionZh": "M1 覆盖和密度已满足，但 latestLagHours 超过阈值。",
+                },
+                {
+                    "kind": "case_memory_category",
+                    "category": "MISSED_OPPORTUNITY",
+                    "status": "MISSING_CATEGORY",
+                    "priority": "HIGH",
+                    "nextActionZh": "收集高分影子机会被挡住后继续走盈利方向的样本。",
+                },
+            ],
+            "nextActionZh": "核心证据完整，但 promotion gate 仍阻断晋级。",
+        }
+
+        lines = qgw.runtime_integrity_summary_lines(payload)
+        text = "\n".join(lines)
+
+        self.assertIn("status=PASS", text)
+        self.assertIn("promotionGate=BLOCKED", text)
+        self.assertIn("promotionBlockers=2", text)
+        self.assertIn("recoveryQueue=2", text)
+        self.assertIn("history:M1", text)
+        self.assertIn("case:MISSED_OPPORTUNITY", text)
+        self.assertNotIn('"artifacts"', text)
 
     def test_manifest_remote_issues_accept_current_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

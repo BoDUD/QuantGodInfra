@@ -142,6 +142,25 @@ def run(cmd: Sequence[str], cwd: pathlib.Path, check: bool = True) -> int:
     return proc.returncode
 
 
+def run_capture(cmd: Sequence[str], cwd: pathlib.Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+    printable = " ".join(str(part) for part in cmd)
+    print(f"\n$ {printable}\n  cwd={cwd}")
+    proc = subprocess.run(
+        [str(part) for part in cmd],
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        if proc.stdout:
+            print(proc.stdout.rstrip())
+        if proc.stderr:
+            print(proc.stderr.rstrip(), file=sys.stderr)
+    if check and proc.returncode != 0:
+        fail(f"command failed with exit code {proc.returncode}: {printable}", proc.returncode)
+    return proc
+
+
 def read_json(path: pathlib.Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -511,7 +530,84 @@ def run_backend_runtime_integrity_verify(backend: pathlib.Path) -> None:
     if not runtime_integrity.exists():
         print(f"skip backend runtime evidence integrity verify: {runtime_integrity} not found")
         return
-    run([sys.executable, str(runtime_integrity), "--runtime-dir", "./runtime", "verify"], backend)
+    proc = run_capture(
+        [sys.executable, str(runtime_integrity), "--runtime-dir", "./runtime", "verify"],
+        backend,
+    )
+    print_runtime_integrity_summary(proc.stdout)
+
+
+def _short_text(value: Any, limit: int = 180) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    return text if len(text) <= limit else f"{text[: limit - 1]}…"
+
+
+def runtime_recovery_label(row: dict[str, Any]) -> str:
+    if row.get("timeframe"):
+        return f"history:{row.get('timeframe')}"
+    if row.get("category"):
+        return f"case:{row.get('category')}"
+    return str(row.get("kind") or row.get("artifactId") or "recovery")
+
+
+def runtime_integrity_summary_lines(payload: dict[str, Any], *, recovery_limit: int = 7) -> list[str]:
+    status = str(payload.get("status") or "UNKNOWN")
+    gate = str(payload.get("promotionGateStatus") or "UNKNOWN")
+    blockers = payload.get("promotionBlockers") if isinstance(payload.get("promotionBlockers"), list) else []
+    queue = payload.get("promotionRecoveryQueue") if isinstance(payload.get("promotionRecoveryQueue"), list) else []
+    lines = [
+        (
+            "Backend runtime evidence integrity: "
+            f"status={status}, promotionGate={gate}, "
+            f"promotionBlockers={len(blockers)}, recoveryQueue={len(queue)}"
+        )
+    ]
+    next_action = _short_text(payload.get("nextActionZh"))
+    if next_action:
+        lines.append(f"  nextActionZh: {next_action}")
+    if blockers:
+        shown = ", ".join(str(item) for item in blockers[:8])
+        suffix = f" (+{len(blockers) - 8} more)" if len(blockers) > 8 else ""
+        lines.append(f"  promotionBlockers: {shown}{suffix}")
+    if queue:
+        lines.append("  promotionRecoveryQueue:")
+        for row in queue[:recovery_limit]:
+            if not isinstance(row, dict):
+                continue
+            label = runtime_recovery_label(row)
+            status_text = str(row.get("status") or "UNKNOWN")
+            priority = str(row.get("priority") or "")
+            action = _short_text(row.get("nextActionZh"), 140)
+            detail = f"    - {label}: {status_text}"
+            if priority:
+                detail += f" priority={priority}"
+            if action:
+                detail += f" :: {action}"
+            lines.append(detail)
+        hidden = len(queue) - min(len(queue), recovery_limit)
+        if hidden > 0:
+            lines.append(f"    ... {hidden} more recovery rows")
+    return lines
+
+
+def print_runtime_integrity_summary(stdout: str) -> None:
+    text = str(stdout or "").strip()
+    if not text:
+        print("Backend runtime evidence integrity: no stdout payload")
+        return
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        print("Backend runtime evidence integrity: non-JSON stdout")
+        print(_short_text(text, 1000))
+        return
+    if not isinstance(payload, dict):
+        print("Backend runtime evidence integrity: unexpected non-object JSON")
+        return
+    for line in runtime_integrity_summary_lines(payload):
+        print(line)
 
 
 def cmd_test(ws: dict[str, Any]) -> None:
