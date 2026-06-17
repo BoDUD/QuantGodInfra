@@ -28,8 +28,32 @@ REPO_KEYS = ("backend", "frontend", "infra", "docs")
 DEFAULT_WORKSPACE = "workspace/quantgod.workspace.json"
 LEGACY_REPO_NAME = "QuantGod"
 LOCAL_TOOL_PREFIXES = (".codex/",)
-LEGACY_PRESET = "MQL5/Presets/QuantGod_MT5_HFM_LivePilot.set"
-LEGACY_POLICY_BUILDER = "tools/usdjpy_strategy_lab/policy_builder.py"
+LIVE_LANE_PRESET = "MQL5/Presets/QuantGod_MT5_HFM_LivePilot.set"
+LIVE_LANE_POLICY_BUILDER = "tools/usdjpy_strategy_lab/policy_builder.py"
+LEGACY_PRESET = LIVE_LANE_PRESET
+LEGACY_POLICY_BUILDER = LIVE_LANE_POLICY_BUILDER
+LIVE_LANE_ALLOWED_STRATEGIES_MARKERS = (
+    'LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal"}',
+    "LIVE_ELIGIBLE_STRATEGIES = {'RSI_Reversal'}",
+)
+LIVE_LANE_ALLOWED_DIRECTION_MARKERS = (
+    'LIVE_ELIGIBLE_DIRECTION = "LONG"',
+    "LIVE_ELIGIBLE_DIRECTION = 'LONG'",
+)
+LIVE_LANE_FORBIDDEN_POLICY_NAMES = (
+    "MA_Cross",
+    "USDJPY_NIGHT_REVERSION_SAFE",
+    "BB_Triple",
+    "MACD_Divergence",
+    "SR_Breakout",
+)
+LIVE_LANE_UNSAFE_PRESET_MARKERS = {
+    "EnableNonRsiLegacyLiveAuthorization=true": "non-RSI legacy live authorization is enabled",
+    "EnablePilotMA=true": "MA_Cross live switch is enabled in live preset",
+    "EnablePilotBBH1Live=true": "BB_Triple live switch is enabled in live preset",
+    "EnablePilotMacdH1Live=true": "MACD_Divergence live switch is enabled in live preset",
+    "EnablePilotSRM15Live=true": "SR_Breakout live switch is enabled in live preset",
+}
 COMMON_LOCAL_IGNORE_PATTERNS = (
     ".codex/",
     ".DS_Store",
@@ -378,30 +402,46 @@ def legacy_repo_path(ws: dict[str, Any], paths: dict[str, pathlib.Path]) -> path
     return (paths["infra"].parent / LEGACY_REPO_NAME).resolve()
 
 
-def legacy_safety_issues(legacy: pathlib.Path) -> list[str]:
+def live_lane_safety_issues(repo: pathlib.Path, *, repo_label: str = "repo") -> list[str]:
     issues: list[str] = []
-    preset = legacy / LEGACY_PRESET
+    preset = repo / LIVE_LANE_PRESET
     if preset.exists():
         text = preset.read_text(encoding="utf-8", errors="ignore")
-        unsafe_markers = {
-            "EnableNonRsiLegacyLiveAuthorization=true": "non-RSI legacy live authorization is enabled",
-            "EnablePilotMA=true": "MA_Cross live switch is enabled in legacy preset",
-            "EnablePilotBBH1Live=true": "BB_Triple live switch is enabled in legacy preset",
-            "EnablePilotMacdH1Live=true": "MACD_Divergence live switch is enabled in legacy preset",
-            "EnablePilotSRM15Live=true": "SR_Breakout live switch is enabled in legacy preset",
-        }
-        for marker, message in unsafe_markers.items():
+        for marker, message in LIVE_LANE_UNSAFE_PRESET_MARKERS.items():
             if marker in text:
-                issues.append(f"{preset}: {message}")
+                issues.append(f"{repo_label} {preset}: {message}")
 
-    policy = legacy / LEGACY_POLICY_BUILDER
+    policy = repo / LIVE_LANE_POLICY_BUILDER
     if policy.exists():
         text = policy.read_text(encoding="utf-8", errors="ignore")
-        if "LIVE_ELIGIBLE_STRATEGIES" in text and ("MA_Cross" in text or "USDJPY_NIGHT_REVERSION_SAFE" in text):
-            issues.append(f"{policy}: live eligibility includes non-RSI strategy names")
-        if 'LIVE_ELIGIBLE_STRATEGY = "RSI_Reversal"' not in text and 'LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal"}' not in text:
-            issues.append(f"{policy}: live eligibility is not locked to RSI_Reversal only")
+        if "LIVE_ELIGIBLE_STRATEGIES" in text and any(
+            strategy_name in text for strategy_name in LIVE_LANE_FORBIDDEN_POLICY_NAMES
+        ):
+            issues.append(f"{repo_label} {policy}: live eligibility includes non-RSI strategy names")
+        if not any(marker in text for marker in LIVE_LANE_ALLOWED_STRATEGIES_MARKERS):
+            issues.append(f"{repo_label} {policy}: live eligibility is not locked to RSI_Reversal only")
+        if "LIVE_ELIGIBLE_DIRECTION" in text and not any(
+            marker in text for marker in LIVE_LANE_ALLOWED_DIRECTION_MARKERS
+        ):
+            issues.append(f"{repo_label} {policy}: live direction is not locked to LONG")
     return issues
+
+
+def legacy_safety_issues(legacy: pathlib.Path) -> list[str]:
+    return live_lane_safety_issues(legacy, repo_label="legacy")
+
+
+def active_backend_live_lane_issues(backend: pathlib.Path) -> list[str]:
+    return live_lane_safety_issues(backend, repo_label="active backend")
+
+
+def check_active_backend_live_lane(backend: pathlib.Path) -> None:
+    issues = active_backend_live_lane_issues(backend)
+    if issues:
+        for issue in issues:
+            print(f"FAIL: {issue}")
+        fail("active backend live lane safety guard failed")
+    print("OK: active backend live lane is locked to RSI_Reversal LONG only")
 
 
 def print_legacy_status(ws: dict[str, Any], paths: dict[str, pathlib.Path]) -> None:
@@ -750,6 +790,7 @@ def cmd_verify(ws: dict[str, Any]) -> None:
     check_active_repos_clean(paths)
     check_tracked_local_tools(paths)
     check_local_artifact_ignores(paths)
+    check_active_backend_live_lane(paths["backend"])
     check_legacy_quarantine(ws, paths)
     check_manifest_remotes(paths)
     run_docs_api_contract_strict(paths["docs"], paths["backend"])

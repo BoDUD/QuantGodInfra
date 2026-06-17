@@ -488,6 +488,75 @@ class WorkspaceHelperTest(unittest.TestCase):
 
         self.assertEqual([], issues)
 
+    def test_active_backend_live_lane_issues_detect_non_rsi_live_residue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = pathlib.Path(tmp) / "QuantGodBackend"
+            preset = backend / qgw.LIVE_LANE_PRESET
+            policy = backend / qgw.LIVE_LANE_POLICY_BUILDER
+            preset.parent.mkdir(parents=True)
+            policy.parent.mkdir(parents=True)
+            preset.write_text(
+                "\n".join(
+                    [
+                        "EnablePilotMA=true",
+                        "EnablePilotMacdH1Live=true",
+                        "EnableNonRsiLegacyLiveAuthorization=true",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            policy.write_text(
+                "\n".join(
+                    [
+                        'LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal", "MA_Cross"}',
+                        'LIVE_ELIGIBLE_DIRECTION = "SHORT"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            issues = qgw.active_backend_live_lane_issues(backend)
+
+        self.assertTrue(any("active backend" in issue for issue in issues))
+        self.assertTrue(any("MA_Cross live switch" in issue for issue in issues))
+        self.assertTrue(any("MACD_Divergence live switch" in issue for issue in issues))
+        self.assertTrue(any("non-RSI legacy live authorization" in issue for issue in issues))
+        self.assertTrue(any("live eligibility includes non-RSI" in issue for issue in issues))
+        self.assertTrue(any("live direction is not locked to LONG" in issue for issue in issues))
+
+    def test_active_backend_live_lane_issues_accept_rsi_long_only_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = pathlib.Path(tmp) / "QuantGodBackend"
+            preset = backend / qgw.LIVE_LANE_PRESET
+            policy = backend / qgw.LIVE_LANE_POLICY_BUILDER
+            preset.parent.mkdir(parents=True)
+            policy.parent.mkdir(parents=True)
+            preset.write_text(
+                "\n".join(
+                    [
+                        "EnablePilotMA=false",
+                        "EnablePilotBBH1Live=false",
+                        "EnablePilotMacdH1Live=false",
+                        "EnablePilotSRM15Live=false",
+                        "EnableNonRsiLegacyLiveAuthorization=false",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            policy.write_text(
+                "\n".join(
+                    [
+                        'LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal"}',
+                        'LIVE_ELIGIBLE_DIRECTION = "LONG"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            issues = qgw.active_backend_live_lane_issues(backend)
+
+        self.assertEqual([], issues)
+
 
 if __name__ == "__main__":
     unittest.main()
