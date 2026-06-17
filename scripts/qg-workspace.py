@@ -560,6 +560,38 @@ def runtime_recovery_command(row: dict[str, Any]) -> str:
     return ""
 
 
+def _runtime_hour_label(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"{number:.1f}h"
+
+
+def runtime_recovery_context(row: dict[str, Any]) -> str:
+    parts: list[str] = []
+    copyrates_status = row.get("copyRatesExportFreshnessStatus")
+    if not copyrates_status and row.get("copyRatesExportStale") is True:
+        copyrates_status = "STALE"
+    if copyrates_status:
+        parts.append(f"CopyRates={copyrates_status}")
+    latest_lag = _runtime_hour_label(row.get("copyRatesExportLatestLagHours") or row.get("latestLagHours"))
+    if latest_lag:
+        parts.append(f"latestLag={latest_lag}")
+
+    sync_status = row.get("continuousSyncStatus")
+    if not sync_status and row.get("continuousSyncRunning") is True:
+        sync_status = "RUNNING"
+    elif not sync_status and row.get("continuousSyncRunning") is False and row.get("continuousSyncScript"):
+        sync_status = "MISSING"
+    if sync_status:
+        parts.append(f"SyncLoop={sync_status}")
+    sync_count = row.get("continuousSyncMatchingProcessCount")
+    if sync_count is not None:
+        parts.append(f"syncMatches={sync_count}")
+    return " ".join(parts)
+
+
 def runtime_integrity_summary_lines(payload: dict[str, Any], *, recovery_limit: int = 7) -> list[str]:
     status = str(payload.get("status") or "UNKNOWN")
     gate = str(payload.get("promotionGateStatus") or "UNKNOWN")
@@ -591,9 +623,15 @@ def runtime_integrity_summary_lines(payload: dict[str, Any], *, recovery_limit: 
             detail = f"    - {label}: {status_text}"
             if priority:
                 detail += f" priority={priority}"
+            context = runtime_recovery_context(row)
+            if context:
+                detail += f" [{context}]"
             if action:
                 detail += f" :: {action}"
             lines.append(detail)
+            sync_action = _short_text(row.get("continuousSyncNextActionZh"), 160)
+            if sync_action:
+                lines.append(f"      sync: {sync_action}")
             command = runtime_recovery_command(row)
             if command:
                 lines.append(f"      command: {command}")

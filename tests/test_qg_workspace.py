@@ -284,6 +284,12 @@ class WorkspaceHelperTest(unittest.TestCase):
                     "timeframe": "M1",
                     "status": "FRESHNESS_STALE",
                     "priority": "HIGH",
+                    "copyRatesExportFreshnessStatus": "STALE",
+                    "copyRatesExportLatestLagHours": 263.4,
+                    "continuousSyncStatus": "MISSING",
+                    "continuousSyncRunning": False,
+                    "continuousSyncMatchingProcessCount": 0,
+                    "continuousSyncNextActionZh": "启动只读 history sync loop，并先刷新 MQL5 CopyRates exporter。",
                     "nextActionZh": "M1 覆盖和密度已满足，但 latestLagHours 超过阈值。",
                     "refreshCommand": "python3 tools/run_usdjpy_strategy_backtest.py --runtime-dir ./runtime sync-klines --months 12 --timeframes M1,M5,M15,H1",
                 },
@@ -309,6 +315,11 @@ class WorkspaceHelperTest(unittest.TestCase):
         self.assertIn("promotionBlockers=2", text)
         self.assertIn("recoveryQueue=2", text)
         self.assertIn("history:M1", text)
+        self.assertIn("CopyRates=STALE", text)
+        self.assertIn("latestLag=263.4h", text)
+        self.assertIn("SyncLoop=MISSING", text)
+        self.assertIn("syncMatches=0", text)
+        self.assertIn("sync: 启动只读 history sync loop", text)
         self.assertIn("case:MISSED_OPPORTUNITY", text)
         self.assertIn("command: python3 tools/run_usdjpy_strategy_backtest.py", text)
         self.assertIn("command: python3 tools/run_usdjpy_bar_replay.py", text)
