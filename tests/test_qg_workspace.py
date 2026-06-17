@@ -398,6 +398,31 @@ class WorkspaceHelperTest(unittest.TestCase):
         self.assertIn("backend repo has uncommitted changes", issues[0])
         self.assertIn("tools/example.py", issues[0])
 
+    def test_workspace_governance_status_lines_cover_status_level_guards(self) -> None:
+        paths = {
+            "backend": pathlib.Path("/tmp/QuantGodBackend"),
+            "frontend": pathlib.Path("/tmp/QuantGodFrontend"),
+            "infra": pathlib.Path("/tmp/QuantGodInfra"),
+            "docs": pathlib.Path("/tmp/QuantGodDocs"),
+        }
+        ws = {"legacy": "/tmp/missing-legacy"}
+
+        with (
+            mock.patch.object(qgw, "active_dirty_issues", return_value=["backend repo has uncommitted changes"]),
+            mock.patch.object(qgw, "tracked_local_tool_issues", return_value=[]),
+            mock.patch.object(qgw, "local_artifact_ignore_issues", return_value=[]),
+            mock.patch.object(qgw, "active_backend_live_lane_issues", return_value=[]),
+            mock.patch.object(qgw, "workspace_manifest_remote_issues", return_value=[]),
+            mock.patch.object(qgw, "split_path_guard_issues", return_value=["legacy absolute path found"]),
+        ):
+            lines = qgw.workspace_governance_status_lines(ws, paths)
+
+        text = "\n".join(lines)
+        self.assertIn("ISSUE: active repo dirty state", text)
+        self.assertIn("OK: tracked local tool files", text)
+        self.assertIn("ISSUE: split path guard / old-path contamination", text)
+        self.assertIn("OK: legacy quarantine", text)
+
     def test_tracked_local_tool_files_filters_codex_paths(self) -> None:
         with mock.patch.object(
             qgw,

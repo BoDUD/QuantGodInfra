@@ -340,21 +340,26 @@ def manifest_remote_issues(manifest_path: pathlib.Path, actual_urls: dict[str, s
 
 
 def check_manifest_remotes(paths: dict[str, pathlib.Path]) -> None:
+    issues = workspace_manifest_remote_issues(paths)
+    if issues:
+        for issue in issues:
+            print(f"FAIL: {issue}")
+        fail("workspace manifest remote verification failed")
+    print("OK: workspace repo manifests match local origin remotes")
+
+
+def workspace_manifest_remote_issues(paths: dict[str, pathlib.Path]) -> list[str]:
     actual_urls: dict[str, str] = {}
     for key, path in paths.items():
         origin = normalize_remote_url(git_origin_url(path))
         if origin:
             actual_urls[key] = origin
     if not actual_urls:
-        return
+        return []
     issues: list[str] = []
     for path in paths.values():
         issues.extend(manifest_remote_issues(path / "repo-manifest.json", actual_urls))
-    if issues:
-        for issue in issues:
-            print(f"FAIL: {issue}")
-        fail("workspace manifest remote verification failed")
-    print("OK: workspace repo manifests match local origin remotes")
+    return issues
 
 
 def active_dirty_issues(paths: dict[str, pathlib.Path]) -> list[str]:
@@ -378,6 +383,15 @@ def check_active_repos_clean(paths: dict[str, pathlib.Path]) -> None:
 
 
 def check_tracked_local_tools(paths: dict[str, pathlib.Path]) -> None:
+    issues = tracked_local_tool_issues(paths)
+    if issues:
+        for issue in issues:
+            print(f"FAIL: {issue}")
+        fail("workspace contains tracked local tool files")
+    print("OK: no active repo tracks .codex local tool files")
+
+
+def tracked_local_tool_issues(paths: dict[str, pathlib.Path]) -> list[str]:
     issues: list[str] = []
     for name, path in paths.items():
         tracked = tracked_local_tool_files(path)
@@ -385,11 +399,7 @@ def check_tracked_local_tools(paths: dict[str, pathlib.Path]) -> None:
             sample = ", ".join(tracked[:8])
             suffix = "" if len(tracked) <= 8 else f", ... +{len(tracked) - 8}"
             issues.append(f"{name} repo tracks local Codex/tool files: {sample}{suffix}")
-    if issues:
-        for issue in issues:
-            print(f"FAIL: {issue}")
-        fail("workspace contains tracked local tool files")
-    print("OK: no active repo tracks .codex local tool files")
+    return issues
 
 
 def legacy_repo_path(ws: dict[str, Any], paths: dict[str, pathlib.Path]) -> pathlib.Path:
@@ -433,6 +443,58 @@ def legacy_safety_issues(legacy: pathlib.Path) -> list[str]:
 
 def active_backend_live_lane_issues(backend: pathlib.Path) -> list[str]:
     return live_lane_safety_issues(backend, repo_label="active backend")
+
+
+def split_path_guard_issues(paths: dict[str, pathlib.Path]) -> list[str]:
+    split_guard = paths["infra"] / "scripts" / "qg-split-path-guard.py"
+    if not split_guard.exists():
+        return [f"split path guard script missing: {split_guard}"]
+    proc = subprocess.run(
+        [
+            "python3",
+            str(split_guard),
+            "--root",
+            str(paths["infra"].parent),
+            "--include-codex-automations",
+        ],
+        cwd=str(paths["infra"]),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if proc.returncode == 0:
+        return []
+    text = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+    return [f"split path guard failed: {_short_text(text, 260)}"]
+
+
+def workspace_governance_status_lines(ws: dict[str, Any], paths: dict[str, pathlib.Path]) -> list[str]:
+    legacy = legacy_repo_path(ws, paths)
+    checks = [
+        ("active repo dirty state", active_dirty_issues(paths)),
+        ("tracked local tool files", tracked_local_tool_issues(paths)),
+        ("local artifact ignore policy", local_artifact_ignore_issues(paths)),
+        ("active backend live lane lock", active_backend_live_lane_issues(paths["backend"])),
+        ("workspace manifest remotes", workspace_manifest_remote_issues(paths)),
+        ("split path guard / old-path contamination", split_path_guard_issues(paths)),
+    ]
+    checks.append(
+        ("legacy quarantine live markers", legacy_safety_issues(legacy))
+        if legacy.exists()
+        else ("legacy quarantine", [])
+    )
+
+    lines: list[str] = []
+    for label, issues in checks:
+        if not issues:
+            lines.append(f"OK: {label}")
+            continue
+        lines.append(f"ISSUE: {label}: {len(issues)}")
+        for issue in issues[:6]:
+            lines.append(f"  - {issue}")
+        if len(issues) > 6:
+            lines.append(f"  ... +{len(issues) - 6}")
+    return lines
 
 
 def check_active_backend_live_lane(backend: pathlib.Path) -> None:
@@ -491,6 +553,9 @@ def cmd_status(ws: dict[str, Any]) -> None:
             continue
         run(["git", "status", "--short", "--branch"], path, check=False)
     print_legacy_status(ws, paths)
+    print("\n== workspace governance summary")
+    for line in workspace_governance_status_lines(ws, paths):
+        print(line)
 
 
 def cmd_pull(ws: dict[str, Any]) -> None:
