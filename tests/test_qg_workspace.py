@@ -16,6 +16,58 @@ spec.loader.exec_module(qgw)
 
 
 class WorkspaceHelperTest(unittest.TestCase):
+    def _write_no_execution_backend_fixture(self, backend: pathlib.Path) -> None:
+        expert = backend / qgw.BACKEND_MQL5_ROOT / "Experts" / "QuantGod_MultiStrategy.mq5"
+        config = backend / qgw.BACKEND_CONFIG_ROOT / "QuantGod_MT5_Start.ini"
+        preset = backend / qgw.BACKEND_PRESET_ROOT / "QuantGod_MT5_HFM_Shadow.set"
+        schema = backend / qgw.BACKEND_LIVE_LOOP_SCHEMA
+        trading_client = backend / qgw.BACKEND_RETIRED_TRADING_CLIENT
+        mac_launcher = backend / qgw.BACKEND_MAC_LAUNCHER
+        for path in (expert, config, preset, schema, trading_client, mac_launcher):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        expert.write_text("bool IsPilotLiveMode() { return false; }\n", encoding="utf-8")
+        config.write_text("[Experts]\nAllowLiveTrading=0\n", encoding="utf-8")
+        preset.write_text(
+            "\n".join(
+                [
+                    "ShadowMode=true",
+                    "ReadOnlyMode=true",
+                    "EnablePilotAutoTrading=false",
+                    "EnablePilotRsiH1Live=false",
+                    "EnableNonRsiLegacyLiveAuthorization=false",
+                    "PilotCloseOnKillSwitch=false",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        schema.write_text(
+            'SAFE_EVIDENCE_BOUNDARY = {"executionLaneExists": False, "existingEaOwnsExecution": False}\n',
+            encoding="utf-8",
+        )
+        trading_client.write_text(
+            "EXECUTION_LANE_EXISTS = False\n",
+            encoding="utf-8",
+        )
+        mac_launcher.write_text(
+            "\n".join(
+                [
+                    "case \"$QG_MT5_START_MODE\" in",
+                    "  shadow|off)",
+                    "assert_shadow_readonly_ea_source \"$EA_SOURCE\"",
+                    'cp MQL5/Presets/QuantGod_MT5_HFM_Shadow.set "$MT5_PRESETS/QuantGod_MT5_HFM_Shadow.set"',
+                    'mv -f "$EA_INSTALLED_OUTPUT" "$EA_DISABLED_OUTPUT"',
+                    '"$EA_BUILD_OUTPUT" -nt "$EA_COMPILE_MARKER"',
+                    'mv -f "$EA_INSTALL_TMP" "$EA_INSTALLED_OUTPUT"',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        for relative in qgw.BACKEND_WINDOWS_LAUNCHERS:
+            launcher = backend / relative
+            launcher.write_text("@echo off\necho retired\nexit /b 2\n", encoding="utf-8")
+
     def test_example_is_portable(self) -> None:
         example = json.loads((ROOT / "workspace/quantgod.workspace.example.json").read_text(encoding="utf-8"))
         self.assertIn("workspaceRoot", example)
@@ -120,6 +172,7 @@ class WorkspaceHelperTest(unittest.TestCase):
             docs = root / "QuantGodDocs"
             (backend / "tools").mkdir(parents=True)
             (backend / "MQL5").mkdir()
+            self._write_no_execution_backend_fixture(backend)
             (frontend / "src").mkdir(parents=True)
             (frontend / "dist").mkdir()
             (frontend / "dist" / "index.html").write_text("new frontend", encoding="utf-8")
@@ -250,6 +303,7 @@ class WorkspaceHelperTest(unittest.TestCase):
             docs = root / "QuantGodDocs"
             (backend / "tools").mkdir(parents=True)
             (backend / "MQL5").mkdir()
+            self._write_no_execution_backend_fixture(backend)
             (frontend / "src").mkdir(parents=True)
             (infra / "scripts").mkdir(parents=True)
             (infra / "scripts" / "qg-workspace.py").write_text("", encoding="utf-8")
@@ -272,6 +326,7 @@ class WorkspaceHelperTest(unittest.TestCase):
             docs = root / "QuantGodDocs"
             (backend / "tools").mkdir(parents=True)
             (backend / "MQL5").mkdir()
+            self._write_no_execution_backend_fixture(backend)
             (frontend / "src").mkdir(parents=True)
             (infra / "scripts").mkdir(parents=True)
             split_guard = infra / "scripts" / "qg-split-path-guard.py"
@@ -303,6 +358,7 @@ class WorkspaceHelperTest(unittest.TestCase):
             docs = root / "QuantGodDocs"
             (backend / "tools").mkdir(parents=True)
             (backend / "MQL5").mkdir()
+            self._write_no_execution_backend_fixture(backend)
             (backend / "tools" / "run_runtime_evidence_integrity.py").write_text("", encoding="utf-8")
             (frontend / "src").mkdir(parents=True)
             (frontend / "package.json").write_text(
@@ -475,6 +531,7 @@ class WorkspaceHelperTest(unittest.TestCase):
             docs = root / "QuantGodDocs"
             (backend / "tools").mkdir(parents=True)
             (backend / "MQL5").mkdir()
+            self._write_no_execution_backend_fixture(backend)
             (backend / "tools" / "run_runtime_evidence_integrity.py").write_text("", encoding="utf-8")
             (frontend / "src").mkdir(parents=True)
             (frontend / "package.json").write_text(
@@ -599,7 +656,7 @@ class WorkspaceHelperTest(unittest.TestCase):
             mock.patch.object(qgw, "active_dirty_issues", return_value=["backend repo has uncommitted changes"]),
             mock.patch.object(qgw, "tracked_local_tool_issues", return_value=[]),
             mock.patch.object(qgw, "local_artifact_ignore_issues", return_value=[]),
-            mock.patch.object(qgw, "active_backend_live_lane_issues", return_value=[]),
+            mock.patch.object(qgw, "active_backend_no_execution_issues", return_value=[]),
             mock.patch.object(qgw, "workspace_manifest_remote_issues", return_value=[]),
             mock.patch.object(qgw, "split_path_guard_issues", return_value=["legacy absolute path found"]),
         ):
@@ -656,123 +713,81 @@ class WorkspaceHelperTest(unittest.TestCase):
 
         self.assertEqual([], issues)
 
-    def test_legacy_safety_issues_detect_non_rsi_live_residue(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            legacy = pathlib.Path(tmp) / "QuantGod"
-            preset = legacy / qgw.LEGACY_PRESET
-            policy = legacy / qgw.LEGACY_POLICY_BUILDER
-            preset.parent.mkdir(parents=True)
-            policy.parent.mkdir(parents=True)
-            preset.write_text(
-                "\n".join(
-                    [
-                        "EnablePilotMA=true",
-                        "EnablePilotBBH1Live=true",
-                        "EnableNonRsiLegacyLiveAuthorization=true",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            policy.write_text(
-                'LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal", "MA_Cross", "USDJPY_NIGHT_REVERSION_SAFE"}\n',
-                encoding="utf-8",
-            )
-
-            issues = qgw.legacy_safety_issues(legacy)
-
-        self.assertTrue(any("MA_Cross live switch" in issue for issue in issues))
-        self.assertTrue(any("non-RSI legacy live authorization" in issue for issue in issues))
-        self.assertTrue(any("live eligibility includes non-RSI" in issue for issue in issues))
-
-    def test_legacy_safety_issues_accept_rsi_only_lock(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            legacy = pathlib.Path(tmp) / "QuantGod"
-            preset = legacy / qgw.LEGACY_PRESET
-            policy = legacy / qgw.LEGACY_POLICY_BUILDER
-            preset.parent.mkdir(parents=True)
-            policy.parent.mkdir(parents=True)
-            preset.write_text(
-                "\n".join(
-                    [
-                        "EnablePilotMA=false",
-                        "EnablePilotBBH1Live=false",
-                        "EnableNonRsiLegacyLiveAuthorization=false",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            policy.write_text('LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal"}\n', encoding="utf-8")
-
-            issues = qgw.legacy_safety_issues(legacy)
-
-        self.assertEqual([], issues)
-
-    def test_active_backend_live_lane_issues_detect_non_rsi_live_residue(self) -> None:
+    def test_active_backend_no_execution_issues_detect_broker_mutation_and_unsafe_startup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             backend = pathlib.Path(tmp) / "QuantGodBackend"
-            preset = backend / qgw.LIVE_LANE_PRESET
-            policy = backend / qgw.LIVE_LANE_POLICY_BUILDER
-            preset.parent.mkdir(parents=True)
-            policy.parent.mkdir(parents=True)
+            self._write_no_execution_backend_fixture(backend)
+            expert = backend / qgw.BACKEND_MQL5_ROOT / "Experts" / "QuantGod_MultiStrategy.mq5"
+            expert.write_text(
+                "#include <Trade\\Trade.mqh>\n"
+                "void Unsafe() { OrderSend(request, result); trade.PositionOpen(); }\n",
+                encoding="utf-8",
+            )
+            config = backend / qgw.BACKEND_CONFIG_ROOT / "QuantGod_MT5_Start.ini"
+            config.write_text(
+                "[Experts]\nallowlivetrading=1\nAllowLiveTrading=0\n",
+                encoding="utf-8",
+            )
+            tester_config = backend / qgw.BACKEND_CONFIG_ROOT / "BacktestLab" / "Unsafe.ini"
+            tester_config.parent.mkdir(parents=True)
+            tester_config.write_text("[StartUp]\nAllowLiveTrading=1\n", encoding="utf-8")
+            preset = backend / qgw.BACKEND_PRESET_ROOT / "QuantGod_MT5_HFM_Shadow.set"
             preset.write_text(
-                "\n".join(
-                    [
-                        "EnablePilotMA=true",
-                        "EnablePilotMacdH1Live=true",
-                        "EnableNonRsiLegacyLiveAuthorization=true",
-                    ]
-                ),
+                "ShadowMode=false\nReadOnlyMode=false\nEnablePilotAutoTrading=true\n"
+                "EnablePilotRsiH1Live=true\nEnableNonRsiLegacyLiveAuthorization=true\n"
+                "PilotCloseOnKillSwitch=true\n",
                 encoding="utf-8",
             )
-            policy.write_text(
-                "\n".join(
-                    [
-                        'LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal", "MA_Cross"}',
-                        'LIVE_ELIGIBLE_DIRECTION = "SHORT"',
-                    ]
-                ),
+            schema = backend / qgw.BACKEND_LIVE_LOOP_SCHEMA
+            schema.write_text(
+                '# SAFE_EVIDENCE_BOUNDARY = {"executionLaneExists": False, "existingEaOwnsExecution": False}\n'
+                'SAFE_EVIDENCE_BOUNDARY = {"executionLaneExists": True, "existingEaOwnsExecution": True}\n',
+                encoding="utf-8",
+            )
+            trading_client = backend / qgw.BACKEND_RETIRED_TRADING_CLIENT
+            trading_client.write_text(
+                "EXECUTION_LANE_EXISTS = True\nmt5.order_send({})\n",
                 encoding="utf-8",
             )
 
-            issues = qgw.active_backend_live_lane_issues(backend)
+            issues = qgw.active_backend_no_execution_issues(backend)
 
-        self.assertTrue(any("active backend" in issue for issue in issues))
-        self.assertTrue(any("MA_Cross live switch" in issue for issue in issues))
-        self.assertTrue(any("MACD_Divergence live switch" in issue for issue in issues))
-        self.assertTrue(any("non-RSI legacy live authorization" in issue for issue in issues))
-        self.assertTrue(any("live eligibility includes non-RSI" in issue for issue in issues))
-        self.assertTrue(any("live direction is not locked to LONG" in issue for issue in issues))
+        joined = "\n".join(issues)
+        self.assertIn("Trade.mqh include", joined)
+        self.assertIn("OrderSend call", joined)
+        self.assertIn("broker mutation method", joined)
+        self.assertIn("AllowLiveTrading must occur once and equal 0", joined)
+        self.assertIn("isolated tester config requires [Tester]", joined)
+        self.assertIn("tester config must not contain [StartUp]", joined)
+        self.assertIn("ShadowMode must occur once and equal true", joined)
+        self.assertIn("EnablePilotAutoTrading must occur once and equal false", joined)
+        self.assertIn("enablepilotrsih1live", joined.lower())
+        self.assertIn("EnableNonRsiLegacyLiveAuthorization must not be true", joined)
+        self.assertIn("PilotCloseOnKillSwitch must not mutate positions", joined)
+        self.assertIn("SAFE_EVIDENCE_BOUNDARY.executionLaneExists must be false", joined)
+        self.assertIn("EXECUTION_LANE_EXISTS must be literal false", joined)
+        self.assertIn("forbidden Python broker mutation call: order_send", joined)
 
-    def test_active_backend_live_lane_issues_accept_rsi_long_only_lock(self) -> None:
+    def test_active_backend_no_execution_issues_fail_closed_when_boundaries_are_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             backend = pathlib.Path(tmp) / "QuantGodBackend"
-            preset = backend / qgw.LIVE_LANE_PRESET
-            policy = backend / qgw.LIVE_LANE_POLICY_BUILDER
-            preset.parent.mkdir(parents=True)
-            policy.parent.mkdir(parents=True)
-            preset.write_text(
-                "\n".join(
-                    [
-                        "EnablePilotMA=false",
-                        "EnablePilotBBH1Live=false",
-                        "EnablePilotMacdH1Live=false",
-                        "EnablePilotSRM15Live=false",
-                        "EnableNonRsiLegacyLiveAuthorization=false",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            policy.write_text(
-                "\n".join(
-                    [
-                        'LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal"}',
-                        'LIVE_ELIGIBLE_DIRECTION = "LONG"',
-                    ]
-                ),
-                encoding="utf-8",
-            )
+            backend.mkdir()
+            issues = qgw.active_backend_no_execution_issues(backend)
 
-            issues = qgw.active_backend_live_lane_issues(backend)
+        joined = "\n".join(issues)
+        self.assertIn("MQL safety boundary is missing", joined)
+        self.assertIn("non-Tester MT5 configs are missing", joined)
+        self.assertIn("non-Backtest MT5 presets are missing", joined)
+        self.assertIn("no-execution safety schema is missing", joined)
+        self.assertIn("retired trading client is missing", joined)
+        self.assertIn("tracked macOS launcher is missing", joined)
+        self.assertIn("tracked Windows launcher is missing", joined)
+
+    def test_active_backend_no_execution_issues_accept_complete_static_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = pathlib.Path(tmp) / "QuantGodBackend"
+            self._write_no_execution_backend_fixture(backend)
+            issues = qgw.active_backend_no_execution_issues(backend)
 
         self.assertEqual([], issues)
 

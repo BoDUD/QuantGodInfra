@@ -16,9 +16,11 @@ internet.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -30,32 +32,32 @@ REPO_KEYS = ("backend", "frontend", "infra", "docs")
 DEFAULT_WORKSPACE = "workspace/quantgod.workspace.json"
 LEGACY_REPO_NAME = "QuantGod"
 LOCAL_TOOL_PREFIXES = (".codex/",)
-LIVE_LANE_PRESET = "MQL5/Presets/QuantGod_MT5_HFM_LivePilot.set"
-LIVE_LANE_POLICY_BUILDER = "tools/usdjpy_strategy_lab/policy_builder.py"
-LEGACY_PRESET = LIVE_LANE_PRESET
-LEGACY_POLICY_BUILDER = LIVE_LANE_POLICY_BUILDER
-LIVE_LANE_ALLOWED_STRATEGIES_MARKERS = (
-    'LIVE_ELIGIBLE_STRATEGIES = {"RSI_Reversal"}',
-    "LIVE_ELIGIBLE_STRATEGIES = {'RSI_Reversal'}",
+BACKEND_MQL5_ROOT = pathlib.Path("MQL5")
+BACKEND_CONFIG_ROOT = BACKEND_MQL5_ROOT / "Config"
+BACKEND_PRESET_ROOT = BACKEND_MQL5_ROOT / "Presets"
+BACKEND_LIVE_LOOP_SCHEMA = pathlib.Path("tools/usdjpy_live_loop/schema.py")
+BACKEND_RETIRED_TRADING_CLIENT = pathlib.Path("tools/mt5_trading_client.py")
+BACKEND_MAC_LAUNCHER = pathlib.Path("Start_QuantGod_mac.sh")
+BACKEND_WINDOWS_LAUNCHERS = (
+    pathlib.Path("Start_QuantGod_MT5.bat"),
+    pathlib.Path("Start_QuantGod_MT5_HFM_Shadow.bat"),
+    pathlib.Path("Start_QuantGod_MT5_HFM_LivePilot.bat"),
 )
-LIVE_LANE_ALLOWED_DIRECTION_MARKERS = (
-    'LIVE_ELIGIBLE_DIRECTION = "LONG"',
-    "LIVE_ELIGIBLE_DIRECTION = 'LONG'",
+BACKEND_MQL_MUTATION_PATTERNS = (
+    ("Trade.mqh include", r"#include\s*<Trade[\\/]Trade\.mqh>"),
+    ("CTrade type", r"\bCTrade\b"),
+    ("legacy g_trade object", r"\bg_trade\b"),
+    ("OrderSend call", r"\bOrderSend(?:Async)?\s*\("),
+    (
+        "broker mutation method",
+        r"\.(?:Buy|Sell|BuyLimit|SellLimit|BuyStop|SellStop|BuyStopLimit|SellStopLimit|"
+        r"PositionOpen|PositionClose|PositionCloseBy|PositionModify|OrderOpen|OrderDelete|OrderModify)\s*\(",
+    ),
+    (
+        "raw trade action",
+        r"TRADE_ACTION_(?:DEAL|PENDING|SLTP|MODIFY|REMOVE|CLOSE_BY)",
+    ),
 )
-LIVE_LANE_FORBIDDEN_POLICY_NAMES = (
-    "MA_Cross",
-    "USDJPY_NIGHT_REVERSION_SAFE",
-    "BB_Triple",
-    "MACD_Divergence",
-    "SR_Breakout",
-)
-LIVE_LANE_UNSAFE_PRESET_MARKERS = {
-    "EnableNonRsiLegacyLiveAuthorization=true": "non-RSI legacy live authorization is enabled",
-    "EnablePilotMA=true": "MA_Cross live switch is enabled in live preset",
-    "EnablePilotBBH1Live=true": "BB_Triple live switch is enabled in live preset",
-    "EnablePilotMacdH1Live=true": "MACD_Divergence live switch is enabled in live preset",
-    "EnablePilotSRM15Live=true": "SR_Breakout live switch is enabled in live preset",
-}
 COMMON_LOCAL_IGNORE_PATTERNS = (
     ".codex/",
     ".DS_Store",
@@ -414,37 +416,223 @@ def legacy_repo_path(ws: dict[str, Any], paths: dict[str, pathlib.Path]) -> path
     return (paths["infra"].parent / LEGACY_REPO_NAME).resolve()
 
 
-def live_lane_safety_issues(repo: pathlib.Path, *, repo_label: str = "repo") -> list[str]:
+def _key_value_lists(path: pathlib.Path) -> dict[str, list[str]]:
+    values: dict[str, list[str]] = {}
+    for raw in path.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";", "[")) or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values.setdefault(key.strip().casefold(), []).append(value.strip())
+    return values
+
+
+def _literal_assignment(tree: ast.AST, name: str) -> Any:
+    for node in ast.walk(tree):
+        value_node: ast.AST | None = None
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            value_node = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
+            value_node = node.value
+        if value_node is not None:
+            try:
+                return ast.literal_eval(value_node)
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+def _literal_dict_assignment(tree: ast.AST, name: str) -> dict[str, Any] | None:
+    for node in ast.walk(tree):
+        value_node: ast.AST | None = None
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            value_node = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
+            value_node = node.value
+        if not isinstance(value_node, ast.Dict):
+            continue
+        result: dict[str, Any] = {}
+        for key_node, item_node in zip(value_node.keys, value_node.values):
+            try:
+                key = ast.literal_eval(key_node)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(key, str):
+                continue
+            try:
+                result[key] = ast.literal_eval(item_node)
+            except (ValueError, TypeError):
+                result[key] = None
+        return result
+    return None
+
+
+def active_backend_no_execution_issues(backend: pathlib.Path) -> list[str]:
+    """Return fail-closed static blockers for the tracked Backend execution boundary."""
+
     issues: list[str] = []
-    preset = repo / LIVE_LANE_PRESET
-    if preset.exists():
-        text = preset.read_text(encoding="utf-8", errors="ignore")
-        for marker, message in LIVE_LANE_UNSAFE_PRESET_MARKERS.items():
-            if marker in text:
-                issues.append(f"{repo_label} {preset}: {message}")
+    mql_root = backend / BACKEND_MQL5_ROOT
+    sources = (
+        sorted(mql_root.rglob("*.mq5"))
+        + sorted(mql_root.rglob("*.mq4"))
+        + sorted(mql_root.rglob("*.mqh"))
+        if mql_root.is_dir()
+        else []
+    )
+    if not sources:
+        issues.append(f"active backend MQL safety boundary is missing under {mql_root}")
+    for source in sources:
+        text = source.read_text(encoding="utf-8-sig", errors="ignore")
+        for label, pattern in BACKEND_MQL_MUTATION_PATTERNS:
+            if re.search(pattern, text):
+                issues.append(f"active backend {source}: forbidden broker mutation surface: {label}")
 
-    policy = repo / LIVE_LANE_POLICY_BUILDER
-    if policy.exists():
-        text = policy.read_text(encoding="utf-8", errors="ignore")
-        if "LIVE_ELIGIBLE_STRATEGIES" in text and any(
-            strategy_name in text for strategy_name in LIVE_LANE_FORBIDDEN_POLICY_NAMES
-        ):
-            issues.append(f"{repo_label} {policy}: live eligibility includes non-RSI strategy names")
-        if not any(marker in text for marker in LIVE_LANE_ALLOWED_STRATEGIES_MARKERS):
-            issues.append(f"{repo_label} {policy}: live eligibility is not locked to RSI_Reversal only")
-        if "LIVE_ELIGIBLE_DIRECTION" in text and not any(
-            marker in text for marker in LIVE_LANE_ALLOWED_DIRECTION_MARKERS
-        ):
-            issues.append(f"{repo_label} {policy}: live direction is not locked to LONG")
+    config_root = backend / BACKEND_CONFIG_ROOT
+    configs = sorted(config_root.glob("*.ini")) if config_root.is_dir() else []
+    if not configs:
+        issues.append(f"active backend non-Tester MT5 configs are missing under {config_root}")
+    for config in configs:
+        values = _key_value_lists(config)
+        if values.get("allowlivetrading") != ["0"]:
+            issues.append(f"active backend {config}: AllowLiveTrading must occur once and equal 0")
+    tester_root = config_root / "BacktestLab"
+    for tester_config in sorted(tester_root.glob("*.ini")) if tester_root.is_dir() else []:
+        text = tester_config.read_text(encoding="utf-8-sig", errors="ignore")
+        if not re.search(r"(?im)^\s*\[Tester\]\s*$", text):
+            issues.append(f"active backend {tester_config}: isolated tester config requires [Tester]")
+        if re.search(r"(?im)^\s*\[StartUp\]\s*$", text):
+            issues.append(f"active backend {tester_config}: tester config must not contain [StartUp]")
+        values = _key_value_lists(tester_config)
+        if any(value != "0" for value in values.get("allowlivetrading", [])):
+            issues.append(f"active backend {tester_config}: tester config must not enable AllowLiveTrading")
+
+    preset_root = backend / BACKEND_PRESET_ROOT
+    presets = (
+        [path for path in sorted(preset_root.glob("*.set")) if "backtest" not in path.name.lower()]
+        if preset_root.is_dir()
+        else []
+    )
+    if not presets:
+        issues.append(f"active backend non-Backtest MT5 presets are missing under {preset_root}")
+    for preset in presets:
+        values = _key_value_lists(preset)
+        required = {
+            "ShadowMode": "true",
+            "ReadOnlyMode": "true",
+            "EnablePilotAutoTrading": "false",
+        }
+        for key, expected in required.items():
+            if [value.lower() for value in values.get(key.casefold(), [])] != [expected]:
+                issues.append(f"active backend {preset}: {key} must occur once and equal {expected}")
+        for key, candidates in values.items():
+            normalized = [value.lower() for value in candidates]
+            if key.startswith("enable") and key.endswith("live") and any(
+                value in {"1", "true", "yes", "on"} for value in normalized
+            ):
+                issues.append(f"active backend {preset}: {key} must not enable a live route")
+            if key.startswith("enable") and key.endswith("live") and len(candidates) > 1:
+                issues.append(f"active backend {preset}: {key} must not be duplicated")
+        non_rsi_values = [
+            value.lower() for value in values.get("enablenonrsilegacyliveauthorization", [])
+        ]
+        if any(value in {"1", "true", "yes", "on"} for value in non_rsi_values):
+            issues.append(
+                f"active backend {preset}: EnableNonRsiLegacyLiveAuthorization must not be true"
+            )
+        if len(non_rsi_values) > 1:
+            issues.append(
+                f"active backend {preset}: EnableNonRsiLegacyLiveAuthorization must not be duplicated"
+            )
+        close_on_kill = [value.lower() for value in values.get("pilotcloseonkillswitch", [])]
+        if any(value in {"1", "true", "yes", "on"} for value in close_on_kill):
+            issues.append(f"active backend {preset}: PilotCloseOnKillSwitch must not mutate positions")
+        if len(close_on_kill) > 1:
+            issues.append(f"active backend {preset}: PilotCloseOnKillSwitch must not be duplicated")
+
+    schema = backend / BACKEND_LIVE_LOOP_SCHEMA
+    if not schema.is_file():
+        issues.append(f"active backend no-execution safety schema is missing: {schema}")
+    else:
+        try:
+            schema_tree = ast.parse(schema.read_text(encoding="utf-8"), filename=str(schema))
+        except (OSError, SyntaxError, UnicodeError) as exc:
+            issues.append(f"active backend {schema}: safety schema is not parseable: {exc}")
+        else:
+            boundary = _literal_dict_assignment(schema_tree, "SAFE_EVIDENCE_BOUNDARY")
+            if not isinstance(boundary, dict):
+                issues.append(f"active backend {schema}: SAFE_EVIDENCE_BOUNDARY must be a literal dictionary")
+            else:
+                for key in ("executionLaneExists", "existingEaOwnsExecution"):
+                    if boundary.get(key) is not False:
+                        issues.append(f"active backend {schema}: SAFE_EVIDENCE_BOUNDARY.{key} must be false")
+
+    trading_client = backend / BACKEND_RETIRED_TRADING_CLIENT
+    if not trading_client.is_file():
+        issues.append(f"active backend retired trading client is missing: {trading_client}")
+    else:
+        try:
+            client_tree = ast.parse(trading_client.read_text(encoding="utf-8"), filename=str(trading_client))
+        except (OSError, SyntaxError, UnicodeError) as exc:
+            issues.append(f"active backend {trading_client}: retired client is not parseable: {exc}")
+        else:
+            if _literal_assignment(client_tree, "EXECUTION_LANE_EXISTS") is not False:
+                issues.append(f"active backend {trading_client}: EXECUTION_LANE_EXISTS must be literal false")
+            for node in ast.walk(client_tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                function = node.func
+                mutation_name = ""
+                if isinstance(function, ast.Attribute) and function.attr.casefold() == "order_send":
+                    mutation_name = function.attr
+                elif isinstance(function, ast.Name) and function.id.casefold() == "order_send":
+                    mutation_name = function.id
+                if mutation_name:
+                    issues.append(
+                        f"active backend {trading_client}:{node.lineno}: forbidden Python broker mutation call: {mutation_name}"
+                    )
+
+    mac_launcher = backend / BACKEND_MAC_LAUNCHER
+    if not mac_launcher.is_file():
+        issues.append(f"active backend tracked macOS launcher is missing: {mac_launcher}")
+    else:
+        launcher_text = mac_launcher.read_text(encoding="utf-8", errors="ignore")
+        required_markers = (
+            "shadow|off)",
+            'assert_shadow_readonly_ea_source "$EA_SOURCE"',
+            'cp MQL5/Presets/QuantGod_MT5_HFM_Shadow.set "$MT5_PRESETS/QuantGod_MT5_HFM_Shadow.set"',
+            'mv -f "$EA_INSTALLED_OUTPUT" "$EA_DISABLED_OUTPUT"',
+            '"$EA_BUILD_OUTPUT" -nt "$EA_COMPILE_MARKER"',
+            'mv -f "$EA_INSTALL_TMP" "$EA_INSTALLED_OUTPUT"',
+        )
+        forbidden_markers = (
+            "QG_MT5_LIVE_LAUNCH_ALLOWED",
+            "QG_MT5_SECONDARY_ENABLED",
+            "prepare_live_config",
+            "rsync -a MQL5/Presets/",
+        )
+        for marker in required_markers:
+            if marker not in launcher_text:
+                issues.append(f"active backend {mac_launcher}: required Shadow/ReadOnly marker is missing: {marker}")
+        for marker in forbidden_markers:
+            if marker in launcher_text:
+                issues.append(f"active backend {mac_launcher}: retired execution startup marker remains: {marker}")
+
+    for relative_launcher in BACKEND_WINDOWS_LAUNCHERS:
+        launcher = backend / relative_launcher
+        if not launcher.is_file():
+            issues.append(f"active backend tracked Windows launcher is missing: {launcher}")
+            continue
+        text = launcher.read_text(encoding="utf-8", errors="ignore")
+        if "retired" not in text.lower() or "exit /b 2" not in text.lower():
+            issues.append(f"active backend {launcher}: launcher must be retired and fail closed")
+        if re.search(r"(?im)^\s*(?:copy|xcopy|start|taskkill)\b", text):
+            issues.append(f"active backend {launcher}: retired launcher still has side effects")
+
     return issues
-
-
-def legacy_safety_issues(legacy: pathlib.Path) -> list[str]:
-    return live_lane_safety_issues(legacy, repo_label="legacy")
-
-
-def active_backend_live_lane_issues(backend: pathlib.Path) -> list[str]:
-    return live_lane_safety_issues(backend, repo_label="active backend")
 
 
 def split_path_guard_issues(paths: dict[str, pathlib.Path]) -> list[str]:
@@ -476,15 +664,11 @@ def workspace_governance_status_lines(ws: dict[str, Any], paths: dict[str, pathl
         ("active repo dirty state", active_dirty_issues(paths)),
         ("tracked local tool files", tracked_local_tool_issues(paths)),
         ("local artifact ignore policy", local_artifact_ignore_issues(paths)),
-        ("active backend live lane lock", active_backend_live_lane_issues(paths["backend"])),
+        ("active backend no-execution boundary", active_backend_no_execution_issues(paths["backend"])),
         ("workspace manifest remotes", workspace_manifest_remote_issues(paths)),
         ("split path guard / old-path contamination", split_path_guard_issues(paths)),
     ]
-    checks.append(
-        ("legacy quarantine live markers", legacy_safety_issues(legacy))
-        if legacy.exists()
-        else ("legacy quarantine", [])
-    )
+    checks.append(("legacy quarantine", []))
 
     lines: list[str] = []
     for label, issues in checks:
@@ -499,13 +683,13 @@ def workspace_governance_status_lines(ws: dict[str, Any], paths: dict[str, pathl
     return lines
 
 
-def check_active_backend_live_lane(backend: pathlib.Path) -> None:
-    issues = active_backend_live_lane_issues(backend)
+def check_active_backend_no_execution(backend: pathlib.Path) -> None:
+    issues = active_backend_no_execution_issues(backend)
     if issues:
         for issue in issues:
             print(f"FAIL: {issue}")
-        fail("active backend live lane safety guard failed")
-    print("OK: active backend live lane is locked to RSI_Reversal LONG only")
+        fail("active backend no-execution safety guard failed")
+    print("OK: active backend has no tracked execution lane or MQL broker mutation surface")
 
 
 def print_legacy_status(ws: dict[str, Any], paths: dict[str, pathlib.Path]) -> None:
@@ -525,11 +709,7 @@ def print_legacy_status(ws: dict[str, Any], paths: dict[str, pathlib.Path]) -> N
             print(f"  {line}")
         if len(dirty) > 12:
             print(f"  ... +{len(dirty) - 12}")
-    issues = legacy_safety_issues(legacy)
-    if issues:
-        print("unsafe legacy markers:")
-        for issue in issues:
-            print(f"  {issue}")
+    print("Legacy contents do not define any active execution contract.")
 
 
 def check_legacy_quarantine(ws: dict[str, Any], paths: dict[str, pathlib.Path]) -> None:
@@ -538,12 +718,7 @@ def check_legacy_quarantine(ws: dict[str, Any], paths: dict[str, pathlib.Path]) 
         print("OK: legacy QuantGod monorepo absent")
         return
     print(f"WARN: legacy QuantGod monorepo present and quarantined :: {legacy}")
-    issues = legacy_safety_issues(legacy)
-    if issues:
-        for issue in issues:
-            print(f"FAIL: {issue}")
-        fail("legacy QuantGod quarantine has unsafe live eligibility residue")
-    print("OK: legacy QuantGod quarantine has no unsafe non-RSI live markers")
+    print("OK: legacy contents are ignored; split-path guard enforces active-repo isolation")
 
 
 def cmd_status(ws: dict[str, Any]) -> None:
@@ -1063,7 +1238,7 @@ def _verify_workspace(ws: dict[str, Any], *, release: bool) -> None:
     check_active_repos_clean(paths)
     check_tracked_local_tools(paths)
     check_local_artifact_ignores(paths)
-    check_active_backend_live_lane(paths["backend"])
+    check_active_backend_no_execution(paths["backend"])
     check_legacy_quarantine(ws, paths)
     check_manifest_remotes(paths)
     run_frontend_contract_guard(paths["frontend"], required=release)

@@ -624,7 +624,7 @@ def render_env(paths: dict[str, Path], *, workspace: Path = DEFAULT_WORKSPACE) -
         "QG_MT5_AI_DEEPSEEK_ENABLED": "0",
         "QG_AUTOMATION_SYMBOLS": "USDJPYc",
         "QG_AUTOMATION_MAX_AGE_SECONDS": "180",
-        "QG_SQLITE_BACKUP_KEEP": "7",
+        "QG_SQLITE_BACKUP_KEEP": "3",
         "QG_RUNTIME_LOG_MAX_MB": "32",
         "QG_RUNTIME_LOG_ARCHIVE_MAX_MB": "1024",
         "QG_RUNTIME_LOG_RETENTION_DAYS": "14",
@@ -794,6 +794,29 @@ require_executable() {
   local path="$1"
   local code="$2"
   [[ -x "$path" ]] || block_service "$code" "required executable is unavailable"
+}
+
+require_positive_integer_env() {
+  local key="$1"
+  local code="$2"
+  local value="${!key-}"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || \
+    block_service "$code" "$key must be a positive integer"
+}
+
+canonical_directory() {
+  "$QG_PYTHON_BIN" - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+if not path.is_absolute():
+    raise SystemExit("path is not absolute")
+resolved = path.resolve(strict=True)
+if not resolved.is_dir():
+    raise SystemExit("path is not a directory")
+print(resolved)
+PY
 }
 
 acquire_singleton_lock() {
@@ -1046,6 +1069,69 @@ PY
 '''
 
 
+AUTOMATION_CHAIN_VALIDATOR = r'''import json
+from pathlib import Path
+import sys
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("schema") != "quantgod.automation_chain.v1":
+    raise SystemExit("automation chain returned an unexpected schema")
+steps = payload.get("steps")
+if not isinstance(steps, list) or not steps or not all(isinstance(step, dict) for step in steps):
+    raise SystemExit("automation chain did not return a non-empty step list")
+required_steps = [step for step in steps if step.get("required") is True]
+if not required_steps:
+    raise SystemExit("automation chain did not return any required steps")
+
+expected_required_ids = {
+    "adaptive_policy",
+    "dynamic_sltp",
+    "entry_trigger",
+    "usdjpy_strategy_policy",
+    "usdjpy_ea_dry_run",
+    "usdjpy_live_loop",
+}
+
+def required_step_identity(step):
+    name = step.get("name")
+    legacy_id = step.get("id")
+    if name is not None and (not isinstance(name, str) or not name):
+        raise SystemExit("automation chain required step has an invalid name identity")
+    if legacy_id is not None and (not isinstance(legacy_id, str) or not legacy_id):
+        raise SystemExit("automation chain required step has an invalid id identity")
+    if name is None and legacy_id is None:
+        raise SystemExit("automation chain required step is missing a name/id identity")
+    if name is not None and legacy_id is not None and name != legacy_id:
+        raise SystemExit("automation chain required step has conflicting name/id identities")
+    return name if name is not None else legacy_id
+
+required_ids = [required_step_identity(step) for step in required_steps]
+if len(required_ids) != len(set(required_ids)):
+    raise SystemExit("automation chain returned duplicate required step identities")
+unknown_ids = set(required_ids) - expected_required_ids
+if unknown_ids:
+    raise SystemExit("automation chain returned unknown required step identities")
+missing_ids = expected_required_ids - set(required_ids)
+if missing_ids:
+    raise SystemExit("automation chain required step identity set is incomplete")
+failed = [
+    identity
+    for identity, step in zip(required_ids, required_steps)
+    if step.get("ok") is not True
+]
+if failed:
+    raise SystemExit("required automation steps failed: " + ", ".join(failed))
+if payload.get("runStatus") != "COMPLETED":
+    raise SystemExit("automation chain did not confirm runStatus=COMPLETED")
+if payload.get("requiredStepCount") != len(required_steps) or payload.get("requiredFailedCount") != 0:
+    raise SystemExit("automation chain required-step counters are inconsistent")
+safety = payload.get("safety") if isinstance(payload.get("safety"), dict) else {}
+for key in ("orderSendAllowed", "brokerExecutionAllowed", "livePresetMutationAllowed"):
+    if safety.get(key) is not False:
+        raise SystemExit(f"automation safety contract missing {key}=false")
+'''
+
+
 def wrapper_header(service_name: str, *service_env_files: str) -> str:
     header = (
         COMMON_WRAPPER.replace("__ENV_PATH__", str(ENV_PATH))
@@ -1284,47 +1370,9 @@ cd "$QG_BACKEND_ROOT"
   --max-age-seconds "$QG_AUTOMATION_MAX_AGE_SECONDS" \
   once > "$report_tmp"
 "$QG_PYTHON_BIN" - "$report_tmp" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if payload.get("schema") != "quantgod.automation_chain.v1":
-    raise SystemExit("automation chain returned an unexpected schema")
-steps = payload.get("steps")
-if not isinstance(steps, list) or not steps or not all(isinstance(step, dict) for step in steps):
-    raise SystemExit("automation chain did not return a non-empty step list")
-required_steps = [step for step in steps if step.get("required") is True]
-if not required_steps:
-    raise SystemExit("automation chain did not return any required steps")
-required_ids = [str(step.get("id") or "") for step in required_steps]
-expected_required_ids = {
-    "adaptive_policy",
-    "dynamic_sltp",
-    "entry_trigger",
-    "usdjpy_strategy_policy",
-    "usdjpy_ea_dry_run",
-    "usdjpy_live_loop",
-}
-if len(required_ids) != len(set(required_ids)):
-    raise SystemExit("automation chain returned duplicate required step ids")
-if set(required_ids) != expected_required_ids:
-    raise SystemExit("automation chain required step identity set is incomplete or unreviewed")
-failed = [
-    step.get("id") or step.get("labelZh") or "unknown"
-    for step in required_steps
-    if step.get("required") is True and step.get("ok") is not True
-]
-if failed:
-    raise SystemExit("required automation steps failed: " + ", ".join(str(item) for item in failed))
-if payload.get("runStatus") != "COMPLETED":
-    raise SystemExit("automation chain did not confirm runStatus=COMPLETED")
-if payload.get("requiredStepCount") != len(required_steps) or payload.get("requiredFailedCount") != 0:
-    raise SystemExit("automation chain required-step counters are inconsistent")
-safety = payload.get("safety") if isinstance(payload.get("safety"), dict) else {}
-for key in ("orderSendAllowed", "brokerExecutionAllowed", "livePresetMutationAllowed"):
-    if safety.get(key) is not False:
-        raise SystemExit(f"automation safety contract missing {key}=false")
+'''
+        + AUTOMATION_CHAIN_VALIDATOR
+        + r'''
 PY
 mv "$report_tmp" "$QG_LAUNCHD_STATUS_ROOT/automation-chain-report.json"
 finish_service "PASS" "AUTOMATION_CHAIN_COMPLETE" "all required advisory stages completed"
@@ -1420,13 +1468,66 @@ finish_service_observed \
         "quantgod-log-maintenance.sh": wrapper_header("log-maintenance")
         + r'''
 require_file "$QG_BACKEND_ROOT/tools/maintain_runtime_logs.py" "LOG_MAINTENANCE_RUNNER_MISSING"
+backend_runtime="$QG_BACKEND_ROOT/runtime"
+require_directory "$QG_BACKEND_ROOT" "BACKEND_ROOT_MISSING"
+require_directory "$backend_runtime" "BACKEND_RUNTIME_DIR_MISSING"
 require_directory "$QG_RUNTIME_DIR" "RUNTIME_DIR_MISSING"
-mark_service "RUNNING" "LOG_MAINTENANCE_START" "rotating runtime and launchd logs"
-"$QG_PYTHON_BIN" "$QG_BACKEND_ROOT/tools/maintain_runtime_logs.py" --runtime-root "$QG_RUNTIME_DIR"
+require_directory "$QG_MT5_FILES_DIR" "MT5_FILES_DIR_MISSING"
+require_directory "$QG_LAUNCHD_LOG_ROOT" "LAUNCHD_LOG_ROOT_MISSING"
+for root in "$QG_BACKEND_ROOT" "$backend_runtime" "$QG_RUNTIME_DIR" "$QG_MT5_FILES_DIR" "$QG_LAUNCHD_LOG_ROOT"; do
+  assert_path_has_no_symlink_components "$root"
+done
+
+if ! backend_root_real="$(canonical_directory "$QG_BACKEND_ROOT")" || \
+   ! backend_runtime_real="$(canonical_directory "$backend_runtime")" || \
+   ! runtime_real="$(canonical_directory "$QG_RUNTIME_DIR")" || \
+   ! mt5_files_real="$(canonical_directory "$QG_MT5_FILES_DIR")" || \
+   ! launchd_log_real="$(canonical_directory "$QG_LAUNCHD_LOG_ROOT")"; then
+  block_service "LOG_MAINTENANCE_PATH_RESOLVE_FAILED" "log maintenance roots could not be canonicalized"
+fi
+[[ "$backend_runtime_real" == "$backend_root_real/runtime" ]] || \
+  block_service "BACKEND_RUNTIME_BOUNDARY_FAILED" "Backend runtime root escaped the Backend repository"
+[[ "$runtime_real" == "$mt5_files_real" ]] || \
+  block_service "MT5_RUNTIME_BOUNDARY_FAILED" "QG_RUNTIME_DIR must match QG_MT5_FILES_DIR"
+[[ "$runtime_real" != "/" && "$backend_runtime_real" != "/" && "$launchd_log_real" != "/" ]] || \
+  block_service "LOG_MAINTENANCE_ROOT_FORBIDDEN" "filesystem root cannot be maintained"
+if [[ "$launchd_log_real" == "$backend_runtime_real" || "$launchd_log_real" == "$runtime_real" ]]; then
+  block_service "LOG_MAINTENANCE_ROOT_COLLISION" "launchd logs must not overlap a runtime evidence root"
+fi
+
+for key_code in \
+  "QG_RUNTIME_LOG_MAX_MB:LOG_MAX_ACTIVE_INVALID" \
+  "QG_RUNTIME_LOG_ARCHIVE_MAX_MB:LOG_ARCHIVE_MAX_INVALID" \
+  "QG_RUNTIME_LOG_RETENTION_DAYS:LOG_RETENTION_INVALID" \
+  "QG_RUNTIME_JSONL_MAX_MB:JSONL_MAX_ACTIVE_INVALID" \
+  "QG_RUNTIME_JSONL_ARCHIVE_MAX_MB:JSONL_ARCHIVE_MAX_INVALID" \
+  "QG_RUNTIME_JSONL_KEEP_LINES:JSONL_KEEP_LINES_INVALID"; do
+  require_positive_integer_env "${key_code%%:*}" "${key_code#*:}"
+done
+
+maintain_runtime_target() {
+  local target="$1"
+  "$QG_PYTHON_BIN" "$QG_BACKEND_ROOT/tools/maintain_runtime_logs.py" \
+    --runtime-root "$target" \
+    --max-active-mb "$QG_RUNTIME_LOG_MAX_MB" \
+    --archive-max-mb "$QG_RUNTIME_LOG_ARCHIVE_MAX_MB" \
+    --retention-days "$QG_RUNTIME_LOG_RETENTION_DAYS" \
+    --max-jsonl-mb "$QG_RUNTIME_JSONL_MAX_MB" \
+    --jsonl-archive-max-mb "$QG_RUNTIME_JSONL_ARCHIVE_MAX_MB" \
+    --jsonl-keep-lines "$QG_RUNTIME_JSONL_KEEP_LINES"
+}
+mark_service "RUNNING" "LOG_MAINTENANCE_START" "rotating Backend runtime, MT5 evidence, and launchd logs"
+maintain_runtime_target "$backend_runtime_real"
+if [[ "$runtime_real" != "$backend_runtime_real" ]]; then
+  maintain_runtime_target "$runtime_real"
+fi
 "$QG_PYTHON_BIN" "$QG_BACKEND_ROOT/tools/maintain_runtime_logs.py" \
-  --runtime-root "$QG_LAUNCHD_LOG_ROOT" \
+  --runtime-root "$launchd_log_real" \
+  --max-active-mb "$QG_RUNTIME_LOG_MAX_MB" \
+  --archive-max-mb "$QG_RUNTIME_LOG_ARCHIVE_MAX_MB" \
+  --retention-days "$QG_RUNTIME_LOG_RETENTION_DAYS" \
   --no-jsonl-maintenance
-finish_service "PASS" "LOG_MAINTENANCE_COMPLETE" "runtime and launchd log maintenance completed"
+finish_service "PASS" "LOG_MAINTENANCE_COMPLETE" "Backend runtime, MT5 evidence, and launchd log maintenance completed"
 ''',
         "quantgod-sqlite-backup.sh": wrapper_header("sqlite-backup")
         + r'''
@@ -1623,6 +1724,44 @@ def render_plist(service: dict[str, Any]) -> dict[str, Any]:
 
 def run_launchctl(args: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["launchctl", *args], text=True, capture_output=True, check=check)
+
+
+def launchd_lifecycle(service: dict[str, Any], output: str) -> dict[str, Any]:
+    values: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        for key in ("state", "last exit code"):
+            prefix = f"{key} ="
+            if key not in values and line.startswith(prefix):
+                values[key] = line[len(prefix) :].strip()
+
+    launchd_state = values.get("state", "unknown")
+    last_exit_raw = values.get("last exit code")
+    last_exit_code = (
+        int(last_exit_raw)
+        if last_exit_raw is not None and re.fullmatch(r"-?[0-9]+", last_exit_raw)
+        else None
+    )
+    normalized_state = launchd_state.lower()
+    if normalized_state == "running":
+        lifecycle = "RUNNING"
+    elif normalized_state == "not running" and service.get("kind") == "interval":
+        if last_exit_code is None:
+            lifecycle = "IDLE_PENDING"
+        elif last_exit_code == 0:
+            lifecycle = "IDLE_OK"
+        else:
+            lifecycle = "FAILED"
+    elif normalized_state == "not running":
+        lifecycle = "STOPPED"
+    else:
+        lifecycle = "UNKNOWN"
+    return {
+        "lifecycle": lifecycle,
+        "launchdState": launchd_state,
+        "lastExitCode": last_exit_code,
+        "lastExitRaw": last_exit_raw,
+    }
 
 
 def launchd_load_state(label: str) -> str:
@@ -1881,6 +2020,21 @@ def install(args: argparse.Namespace) -> int:
     frontend_build_selected = "frontend-dist-build" in selected_names
     if frontend_build_selected:
         build_frontend_dist(paths)
+        capabilities = build_capability_report(paths, workspace=args.workspace)["services"]
+        blocked = selected_capability_blockers(
+            capabilities,
+            selected_names,
+            allow_frontend_build_output=True,
+        )
+        if blocked:
+            details = "; ".join(
+                f"{row['service']}={','.join(row['reasonCodes'])}"
+                for row in blocked
+            )
+            raise RuntimeError(
+                "frontend build completed but pre-switch capability preflight is blocked: "
+                + details
+            )
 
     previous_loaded = [label for label in all_labels if is_loaded(label)]
     previous_files = snapshot_managed_files()
@@ -1998,10 +2152,13 @@ def status(args: argparse.Namespace) -> int:
                     f"generatedAt={runtime_status.get('generatedAt', 'UNKNOWN')}"
                 )
         if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("state =") or stripped.startswith("last exit code ="):
-                    print(f"  {stripped}")
+            lifecycle = launchd_lifecycle(service, result.stdout)
+            last_exit = lifecycle["lastExitRaw"] or "unknown"
+            print(
+                f"  lifecycle={lifecycle['lifecycle']} "
+                f"launchdState={lifecycle['launchdState']} "
+                f"lastExit={last_exit}"
+            )
         else:
             err = (result.stderr or result.stdout or "").strip()
             if err:

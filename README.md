@@ -58,11 +58,11 @@ python3 scripts/qg-workspace.py --workspace workspace/quantgod.workspace.json cl
 3. Sync `dist/` into backend `Dashboard/vue-dist/`.
 4. Run backend and docs verification.
 
-It does not modify MT5 live presets, credentials, wallet state, or trading configuration.
+It does not modify tracked MT5 presets, credentials, wallet state, or broker configuration.
 
-`verify` (also available as `verify-integrity`) is the backward-compatible, read-only structure and evidence-integrity check. It runs the Docs strict API contract check against Backend with `--strict-extra --min-endpoints 100`, then verifies Backend core runtime evidence integrity with `tools/run_runtime_evidence_integrity.py --runtime-dir ./runtime verify`. It does not authorize a release.
+`verify` (also available as `verify-integrity`) is the backward-compatible, read-only structure and evidence-integrity check. Before accepting evidence it scans every tracked Backend `.mq5`/`.mqh` source for broker-mutation surfaces, verifies all ordinary MT5 configs and presets remain Shadow/ReadOnly, confirms tracked launchers fail closed, and requires the upper safety contract to declare `executionLaneExists=false` and `existingEaOwnsExecution=false`. It then runs the Docs strict API contract check against Backend with `--strict-extra --min-endpoints 100` and verifies Backend core runtime evidence integrity with `tools/run_runtime_evidence_integrity.py --runtime-dir ./runtime verify`. It does not authorize a release or trading execution.
 
-`verify-release` is the explicit fail-closed release acceptance gate. Required contract/integrity guards must exist, runtime evidence must return valid JSON, and both integrity and `promotionGateStatus` must be `PASS`; blockers, stale evidence, or missing evidence return a non-zero exit. Neither verification command writes MT5 order request/receipt files, mutates live presets, or enables broker execution.
+`verify-release` is the explicit fail-closed release acceptance gate. Required contract/integrity guards must exist, the no-execution static boundary must pass, runtime evidence must return valid JSON, and both integrity and `promotionGateStatus` must be `PASS`; blockers, stale evidence, or missing evidence return a non-zero exit. Neither verification command writes MT5 order request/receipt files, mutates tracked presets, or enables broker execution.
 
 `sync-frontend-dist` copies the built frontend into a verified staging directory, compares SHA-256 manifests, then atomically promotes it. An existing backend dist is preserved as a sibling `vue-dist.previous-*` directory, and a failed promotion restores the active dist.
 
@@ -156,9 +156,17 @@ Generated agents:
 | `com.quantgod.usdjpy-history-sync` | Hourly USDJPY MT5 K-line sync into `runtime/backtest/usdjpy.sqlite` |
 | `com.quantgod.automation-chain` | Five-minute advisory-only automation chain with required-step result validation |
 | `com.quantgod.health-maintenance` | Minute-level local AgentOps/runtime health evidence refresh |
-| `com.quantgod.log-maintenance` | Independent hourly runtime and launchd log rotation |
-| `com.quantgod.sqlite-backup` | Daily online SQLite backup followed by `quick_check`, SHA-256 verification, and bounded retention |
+| `com.quantgod.log-maintenance` | Hourly rotation for Backend `runtime/`, the active MT5 evidence root, and launchd logs, with explicit 32 MB active / 1024 MB archive caps |
+| `com.quantgod.sqlite-backup` | Daily online SQLite backup followed by `quick_check`, SHA-256 verification, and retention of the latest 3 verified backup sets |
 | `com.quantgod.ai-telegram-monitor` | DeepSeek-assisted MT5 advisory push-only monitor |
+
+`qg-macos-launchd.py status` reports scheduling lifecycle separately from the
+last wrapper result. A loaded interval job is expected to be `not running`
+between invocations: a zero last-exit code is shown as `IDLE_OK`, no completed
+invocation yet is `IDLE_PENDING`, and a non-zero last-exit code remains
+`FAILED`. This lifecycle classification does not override `runtimeStatus`,
+`observedHealth`, or `observedReadiness`; those fields continue to fail closed
+on stale, blocked, or failed evidence.
 
 Private environment values live in `~/.quantgod/launchd.env`. Logs are written
 to `~/.quantgod/logs/`; capability and per-service runtime states are under
@@ -169,6 +177,12 @@ failure but is not a second-device disaster backup. The installer enforces mode
 refuses symlink targets, and sets launchd `Umask=077` for future files. Core
 wrappers do not load Telegram or DeepSeek secret files; those files are visible
 only to the explicitly opted-in outbound monitor that needs them.
+
+Log maintenance canonicalizes all three roots, rejects symlink components and
+root collisions, and de-duplicates Backend runtime versus active MT5 evidence
+when they resolve to the same directory. SQLite backup creates and validates the
+new set before pruning; only backup sets with verified identity are eligible for
+the keep-3 retention cleanup.
 
 Uninstall:
 
@@ -247,15 +261,15 @@ python3 scripts/qg-split-path-guard.py --root /Users/bowen/Desktop/Quard --inclu
 Focused launchd tests:
 
 ```bash
-python3 -m unittest tests.test_macos_launchd -v
+python3 -m unittest discover -s tests -p 'test_macos_launchd.py' -v
 ```
 
 ## Safety Boundaries
 
 Infra may start processes and synchronize static assets. It must not:
 
-- Write MT5 live trading decisions.
+- Write MT5 broker-execution decisions or introduce an execution lane.
 - Store Telegram, DeepSeek, broker, wallet, or private-key secrets in Git.
 - Add Telegram command execution.
-- Mutate live preset risk settings.
+- Mutate tracked Shadow/ReadOnly preset safety settings.
 - Add any remote snapshot upload or public ingress path; this system is local-only.

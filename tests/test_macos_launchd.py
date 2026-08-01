@@ -23,6 +23,60 @@ spec.loader.exec_module(launchd)
 
 
 class MacLaunchdHelperTests(unittest.TestCase):
+    AUTOMATION_REQUIRED_STEP_IDS = (
+        "adaptive_policy",
+        "dynamic_sltp",
+        "entry_trigger",
+        "usdjpy_strategy_policy",
+        "usdjpy_ea_dry_run",
+        "usdjpy_live_loop",
+    )
+
+    def setUp(self) -> None:
+        # Linux CI commonly exposes only the root-owned /tmp when TMPDIR is
+        # absent. launchd on macOS supplies a per-user TMPDIR, so model that
+        # contract explicitly instead of weakening the production owner check.
+        self._launchd_user_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._launchd_user_tmp.cleanup)
+        self._tmpdir_patch = mock.patch.dict(
+            os.environ,
+            {"TMPDIR": self._launchd_user_tmp.name},
+        )
+        self._tmpdir_patch.start()
+        self.addCleanup(self._tmpdir_patch.stop)
+
+    def _automation_payload(self, *, identity_field: str = "name") -> dict[str, object]:
+        steps = [
+            {identity_field: step_id, "required": True, "ok": True}
+            for step_id in self.AUTOMATION_REQUIRED_STEP_IDS
+        ]
+        return {
+            "schema": "quantgod.automation_chain.v1",
+            "runStatus": "COMPLETED",
+            "steps": steps,
+            "requiredStepCount": len(steps),
+            "requiredFailedCount": 0,
+            "safety": {
+                "orderSendAllowed": False,
+                "brokerExecutionAllowed": False,
+                "livePresetMutationAllowed": False,
+            },
+        }
+
+    def _validate_automation_payload(
+        self, payload: dict[str, object]
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "automation.json"
+            report.write_text(json.dumps(payload), encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, "-", str(report)],
+                input=launchd.AUTOMATION_CHAIN_VALIDATOR,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
     def _create_mt5_wrapper_fixture(
         self,
         root: pathlib.Path,
@@ -145,6 +199,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
             self.assertIn("QG_LEGACY_DAILY_AUTOPILOT_ENABLED='0'", text)
             self.assertIn("QG_AGENT_V25_INTERVAL_SECONDS='300'", text)
             self.assertIn("QG_AGENT_V25_SEND_TELEGRAM='0'", text)
+            self.assertIn("QG_SQLITE_BACKUP_KEEP='3'", text)
             self.assertIn("QG_AGENT_V25_HEAVY_TELEGRAM_GATEWAY='0'", text)
             self.assertIn("QG_AGENT_OPS_HEALTH_ENABLED='1'", text)
             self.assertIn("QG_PRODUCTION_BURN_IN_ENABLED='1'", text)
@@ -202,6 +257,24 @@ class MacLaunchdHelperTests(unittest.TestCase):
         self.assertIn("MT5_LOCAL_USER_MISMATCH", issues)
         self.assertIn("MT5_USER_TMPDIR_SYMLINKED", issues)
         self.assertIn("MT5_USER_LANG_INVALID", issues)
+
+    def test_local_wine_user_environment_rejects_mocked_tmpdir_owner_mismatch(self) -> None:
+        values = launchd.local_user_environment()
+        tmpdir = pathlib.Path(values["QG_USER_TMPDIR"])
+        original_stat = pathlib.Path.stat
+
+        def stat_with_foreign_tmp_owner(path: pathlib.Path, *args, **kwargs):
+            metadata = original_stat(path, *args, **kwargs)
+            if path == tmpdir:
+                fields = list(metadata)
+                fields[4] = os.getuid() + 1
+                return os.stat_result(fields)
+            return metadata
+
+        with mock.patch.object(pathlib.Path, "stat", stat_with_foreign_tmp_owner):
+            issues = launchd.local_user_environment_issues(values)
+
+        self.assertIn("MT5_USER_TMPDIR_OWNER_MISMATCH", issues)
 
     def test_daily_autopilot_wrapper_is_explicitly_blocked_on_unsafe_failure_contract(self) -> None:
         wrappers = launchd.render_wrappers()
@@ -343,6 +416,46 @@ class MacLaunchdHelperTests(unittest.TestCase):
         self.assertGreater(events.index("discard"), events.index(backend_event))
         self.assertFalse(any("frontend-dist-build" in event for event in events if event.startswith("bootstrap:")))
 
+    def test_local_shadow_capability_drift_after_build_blocks_before_service_switch(self) -> None:
+        args = launchd.build_parser().parse_args(["install", "--profile", "local-shadow"])
+        paths = {
+            "backend": pathlib.Path("b"),
+            "frontend": pathlib.Path("f"),
+            "infra": pathlib.Path("i"),
+            "docs": pathlib.Path("d"),
+        }
+        ready = {
+            name: {"service": name, "ready": True, "status": "READY", "reasonCodes": []}
+            for name in launchd.SERVICES
+        }
+        drifted = {name: dict(row) for name, row in ready.items()}
+        drifted["mt5-shadow-supervisor"] = {
+            "service": "mt5-shadow-supervisor",
+            "ready": False,
+            "status": "BLOCKED",
+            "reasonCodes": ["MT5_USER_TMPDIR_OWNER_MISMATCH"],
+        }
+        reports = [{"services": ready}, {"services": drifted}]
+        with (
+            mock.patch.object(launchd, "load_workspace", return_value=paths),
+            mock.patch.object(launchd, "build_capability_report", side_effect=reports),
+            mock.patch.object(launchd, "build_frontend_dist") as build,
+            mock.patch.object(launchd, "is_loaded") as is_loaded,
+            mock.patch.object(launchd, "snapshot_managed_files") as snapshot,
+            mock.patch.object(launchd, "bootout") as bootout,
+            mock.patch.object(launchd, "write_files") as write_files,
+            mock.patch.object(launchd, "bootstrap") as bootstrap,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "pre-switch capability preflight is blocked"):
+                launchd.install(args)
+
+        build.assert_called_once_with(paths)
+        is_loaded.assert_not_called()
+        snapshot.assert_not_called()
+        bootout.assert_not_called()
+        write_files.assert_not_called()
+        bootstrap.assert_not_called()
+
     def test_local_shadow_activation_failure_restores_frontend_dist_and_old_profile(self) -> None:
         args = launchd.build_parser().parse_args(["install", "--profile", "local-shadow"])
         paths = {
@@ -424,6 +537,32 @@ class MacLaunchdHelperTests(unittest.TestCase):
         self.assertNotIn("|| echo", history)
         self.assertIn("QG_BACKEND_ROOT", history)
 
+    def test_log_maintenance_wrapper_covers_three_bounded_roots_with_explicit_caps(self) -> None:
+        wrapper = launchd.render_wrappers()["quantgod-log-maintenance.sh"]
+        self.assertIn('backend_runtime="$QG_BACKEND_ROOT/runtime"', wrapper)
+        self.assertIn('maintain_runtime_target "$backend_runtime_real"', wrapper)
+        self.assertIn('if [[ "$runtime_real" != "$backend_runtime_real" ]]', wrapper)
+        self.assertIn('maintain_runtime_target "$runtime_real"', wrapper)
+        self.assertIn('--runtime-root "$launchd_log_real"', wrapper)
+        self.assertIn('[[ "$runtime_real" == "$mt5_files_real" ]]', wrapper)
+        self.assertIn("LOG_MAINTENANCE_ROOT_COLLISION", wrapper)
+        self.assertIn("assert_path_has_no_symlink_components", wrapper)
+        for key in (
+            "QG_RUNTIME_LOG_MAX_MB",
+            "QG_RUNTIME_LOG_ARCHIVE_MAX_MB",
+            "QG_RUNTIME_LOG_RETENTION_DAYS",
+            "QG_RUNTIME_JSONL_MAX_MB",
+            "QG_RUNTIME_JSONL_ARCHIVE_MAX_MB",
+            "QG_RUNTIME_JSONL_KEEP_LINES",
+        ):
+            self.assertIn(f'require_positive_integer_env "${{key_code%%:*}}"', wrapper)
+            self.assertIn(key, wrapper)
+        self.assertEqual(wrapper.count('--max-active-mb "$QG_RUNTIME_LOG_MAX_MB"'), 2)
+        self.assertEqual(wrapper.count('--archive-max-mb "$QG_RUNTIME_LOG_ARCHIVE_MAX_MB"'), 2)
+        self.assertEqual(wrapper.count('--retention-days "$QG_RUNTIME_LOG_RETENTION_DAYS"'), 2)
+        self.assertEqual(wrapper.count('--max-jsonl-mb "$QG_RUNTIME_JSONL_MAX_MB"'), 1)
+        self.assertEqual(wrapper.count("--no-jsonl-maintenance"), 1)
+
     def test_local_shadow_wrappers_are_singleton_and_fail_closed(self) -> None:
         wrappers = launchd.render_wrappers()
         for name in launchd.SERVICE_PROFILES["local-shadow"]:
@@ -493,8 +632,11 @@ class MacLaunchdHelperTests(unittest.TestCase):
         automation = wrappers["quantgod-automation-chain.sh"]
         self.assertIn("did not return a non-empty step list", automation)
         self.assertIn("did not return any required steps", automation)
-        self.assertIn("duplicate required step ids", automation)
-        self.assertIn("required step identity set is incomplete or unreviewed", automation)
+        self.assertIn("missing a name/id identity", automation)
+        self.assertIn("conflicting name/id identities", automation)
+        self.assertIn("duplicate required step identities", automation)
+        self.assertIn("unknown required step identities", automation)
+        self.assertIn("required step identity set is incomplete", automation)
         for step_id in (
             "adaptive_policy",
             "dynamic_sltp",
@@ -530,6 +672,44 @@ class MacLaunchdHelperTests(unittest.TestCase):
         self.assertIn("SHADOW_READONLY", health)
         self.assertIn("finish_service_observed", health)
         self.assertIn("observedReadiness", health)
+
+    def test_automation_validator_accepts_backend_name_contract_and_legacy_id(self) -> None:
+        for identity_field in ("name", "id"):
+            with self.subTest(identity_field=identity_field):
+                result = self._validate_automation_payload(
+                    self._automation_payload(identity_field=identity_field)
+                )
+                self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_automation_validator_rejects_missing_duplicate_unknown_and_conflicting_identity(self) -> None:
+        cases = []
+
+        missing_identity = self._automation_payload()
+        del missing_identity["steps"][0]["name"]
+        cases.append((missing_identity, "missing a name/id identity"))
+
+        duplicate_identity = self._automation_payload()
+        duplicate_identity["steps"][1]["name"] = duplicate_identity["steps"][0]["name"]
+        cases.append((duplicate_identity, "duplicate required step identities"))
+
+        unknown_identity = self._automation_payload()
+        unknown_identity["steps"][0]["name"] = "unreviewed_required_step"
+        cases.append((unknown_identity, "unknown required step identities"))
+
+        missing_expected_identity = self._automation_payload()
+        missing_expected_identity["steps"].pop()
+        missing_expected_identity["requiredStepCount"] -= 1
+        cases.append((missing_expected_identity, "required step identity set is incomplete"))
+
+        conflicting_identity = self._automation_payload()
+        conflicting_identity["steps"][0]["id"] = "dynamic_sltp"
+        cases.append((conflicting_identity, "conflicting name/id identities"))
+
+        for payload, error in cases:
+            with self.subTest(error=error):
+                result = self._validate_automation_payload(payload)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
 
     def test_mt5_supervisor_records_terminal_child_exit_states(self) -> None:
         for child_rc, expected_state, expected_code in (
@@ -1086,6 +1266,26 @@ class MacLaunchdHelperTests(unittest.TestCase):
         with mock.patch.object(launchd, "run_launchctl", side_effect=[query_error, loaded]):
             with self.assertRaisesRegex(RuntimeError, "Operation not permitted"):
                 launchd.bootout(label, verify=True)
+
+    def test_interval_launchd_idle_is_not_misclassified_as_stopped(self) -> None:
+        interval = launchd.SERVICES["usdjpy-history-sync"]
+        cases = (
+            ("state = running\n", "RUNNING"),
+            ("state = not running\nlast exit code = 0\n", "IDLE_OK"),
+            ("state = not running\nlast exit code = (never exited)\n", "IDLE_PENDING"),
+            ("state = not running\nlast exit code = 7\n", "FAILED"),
+        )
+        for output, expected in cases:
+            with self.subTest(expected=expected):
+                observed = launchd.launchd_lifecycle(interval, output)
+                self.assertEqual(observed["lifecycle"], expected)
+
+        persistent = launchd.SERVICES["backend-api"]
+        observed = launchd.launchd_lifecycle(
+            persistent,
+            "state = not running\nlast exit code = 0\n",
+        )
+        self.assertEqual(observed["lifecycle"], "STOPPED")
 
     def test_private_directory_chain_rejects_backup_ancestor_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
