@@ -2079,9 +2079,6 @@ def install(args: argparse.Namespace) -> int:
         stop_failed = any(message.startswith("service stop failed") for message in rollback_errors)
         if not stop_failed:
             for label in previous_loaded:
-                if not plist_path(label).is_file():
-                    rollback_errors.append(f"previous plist unavailable: {label}")
-                    continue
                 try:
                     bootstrap(label)
                 except Exception as exc:
