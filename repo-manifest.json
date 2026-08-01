@@ -19,7 +19,7 @@
       "name": "BoDUD/QuantGodInfra",
       "path": ".",
       "url": "https://github.com/BoDUD/QuantGodInfra",
-      "role": "workspace automation, Cloudflare, deployment sync"
+      "role": "local workspace automation and deployment sync"
     },
     "docs": {
       "name": "BoDUD/QuantGodDocs",

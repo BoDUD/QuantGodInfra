@@ -41,19 +41,19 @@ SECRET_PATTERNS = [
 BOUNDARY_MARKERS = {
     "QuantGodBackend": {
         "allowed": ["MQL5", "Dashboard", "tools", "tests"],
-        "forbidden": ["frontend/src", "cloudflare"],
+        "forbidden": ["frontend/src"],
     },
     "QuantGodFrontend": {
         "allowed": ["src", "package.json", "vite.config.js"],
-        "forbidden": ["MQL5", "Dashboard", "tools/ai_analysis", "cloudflare"],
+        "forbidden": ["MQL5", "Dashboard", "tools/ai_analysis"],
     },
     "QuantGodInfra": {
-        "allowed": ["scripts", "workspace", "cloudflare"],
+        "allowed": ["scripts", "workspace"],
         "forbidden": ["MQL5", "src/App.vue", "tools/ai_analysis"],
     },
     "QuantGodDocs": {
         "allowed": ["docs", "scripts", "tests"],
-        "forbidden": ["MQL5", "Dashboard", "src/App.vue", "cloudflare"],
+        "forbidden": ["MQL5", "Dashboard", "src/App.vue"],
     },
 }
 

@@ -16,11 +16,13 @@ internet.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import shutil
 import subprocess
 import sys
+import uuid
 from collections.abc import Sequence
 from typing import Any
 
@@ -76,7 +78,7 @@ REPO_LOCAL_IGNORE_PATTERNS = {
         "archive/param-lab/runs/",
     ),
     "frontend": ("dist/", ".vite/", "coverage/"),
-    "infra": ("workspace/*.local.json", ".wrangler/"),
+    "infra": ("workspace/*.local.json",),
     "docs": (),
 }
 
@@ -600,14 +602,20 @@ def run_frontend_quality(frontend: pathlib.Path) -> None:
             run(["npm", "run", script_name], frontend)
 
 
-def run_frontend_contract_guard(frontend: pathlib.Path) -> None:
+def run_frontend_contract_guard(frontend: pathlib.Path, *, required: bool = False) -> None:
     """Run the lightweight frontend/API contract guard during workspace verify."""
 
     if not (frontend / "package.json").exists():
-        print(f"skip frontend contract guard: package.json not found in {frontend}")
+        message = f"frontend contract guard unavailable: package.json not found in {frontend}"
+        if required:
+            fail(message)
+        print(f"skip {message}")
         return
     if not has_npm_script(frontend, "contract"):
-        print("skip frontend contract guard: package.json does not define scripts.contract")
+        message = "frontend contract guard unavailable: package.json does not define scripts.contract"
+        if required:
+            fail(message)
+        print(f"skip {message}")
         return
     run(["npm", "run", "contract"], frontend)
 
@@ -620,11 +628,14 @@ def run_docs_checks(docs: pathlib.Path) -> None:
         print(f"skip docs link check: {docs_check} not found")
 
 
-def run_docs_api_contract_strict(docs: pathlib.Path, backend: pathlib.Path) -> None:
+def run_docs_api_contract_strict(docs: pathlib.Path, backend: pathlib.Path, *, required: bool = False) -> None:
     contract_check = docs / "scripts" / "check_api_contract_matches_backend.py"
     contract = docs / "docs" / "contracts" / "api-contract.json"
     if not contract_check.exists() or not contract.exists():
-        print(f"skip docs API contract strict check: {contract_check} or {contract} not found")
+        message = f"docs API contract strict check unavailable: {contract_check} or {contract} not found"
+        if required:
+            fail(message)
+        print(f"skip {message}")
         return
     run(
         [
@@ -642,16 +653,38 @@ def run_docs_api_contract_strict(docs: pathlib.Path, backend: pathlib.Path) -> N
     )
 
 
-def run_backend_runtime_integrity_verify(backend: pathlib.Path) -> None:
+def _runtime_integrity_payload(stdout: str) -> dict[str, Any] | None:
+    text = str(stdout or "").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def run_backend_runtime_integrity_verify(
+    backend: pathlib.Path,
+    *,
+    required: bool = False,
+) -> dict[str, Any] | None:
     runtime_integrity = backend / "tools" / "run_runtime_evidence_integrity.py"
     if not runtime_integrity.exists():
-        print(f"skip backend runtime evidence integrity verify: {runtime_integrity} not found")
-        return
+        message = f"backend runtime evidence integrity verify unavailable: {runtime_integrity} not found"
+        if required:
+            fail(message)
+        print(f"skip {message}")
+        return None
     proc = run_capture(
         [sys.executable, str(runtime_integrity), "--runtime-dir", "./runtime", "verify"],
         backend,
     )
     print_runtime_integrity_summary(proc.stdout)
+    payload = _runtime_integrity_payload(proc.stdout)
+    if required and payload is None:
+        fail("backend runtime evidence integrity verify did not return a JSON object")
+    return payload
 
 
 def _short_text(value: Any, limit: int = 180) -> str:
@@ -776,6 +809,88 @@ def print_runtime_integrity_summary(stdout: str) -> None:
         print(line)
 
 
+RELEASE_BLOCKING_STATUS_MARKERS = (
+    "BLOCKED",
+    "ERROR",
+    "FAIL",
+    "MISSING",
+    "NOT_PASS",
+    "STALE",
+)
+
+
+def _release_blocking_status(value: Any) -> bool:
+    status = str(value or "").strip().upper()
+    return bool(status) and any(marker in status for marker in RELEASE_BLOCKING_STATUS_MARKERS)
+
+
+def release_runtime_integrity_issues(payload: dict[str, Any] | None) -> list[str]:
+    """Return fail-closed runtime blockers for the explicit release gate."""
+
+    if not isinstance(payload, dict):
+        return ["runtime integrity payload is missing or is not a JSON object"]
+
+    issues: list[str] = []
+    required_fields = (
+        "status",
+        "ok",
+        "promotionGateStatus",
+        "promotionGatePassed",
+        "promotionBlockers",
+        "promotionRecoveryQueue",
+    )
+    for field in required_fields:
+        if field not in payload:
+            issues.append(f"runtime integrity payload missing required field: {field}")
+
+    if str(payload.get("status") or "").upper() != "PASS":
+        issues.append(f"runtime integrity status is not PASS: {payload.get('status') or 'MISSING'}")
+    if payload.get("ok") is not True:
+        issues.append("runtime integrity ok is not true")
+    if str(payload.get("promotionGateStatus") or "").upper() != "PASS":
+        issues.append(
+            f"promotion gate is not PASS: {payload.get('promotionGateStatus') or 'MISSING'}"
+        )
+    if payload.get("promotionGatePassed") is not True:
+        issues.append("promotionGatePassed is not true")
+
+    blockers = payload.get("promotionBlockers")
+    if not isinstance(blockers, list):
+        issues.append("promotionBlockers is missing or is not a list")
+    elif blockers:
+        issues.append(f"promotion blockers remain: {len(blockers)}")
+
+    recovery_queue = payload.get("promotionRecoveryQueue")
+    if not isinstance(recovery_queue, list):
+        issues.append("promotionRecoveryQueue is missing or is not a list")
+    else:
+        for index, row in enumerate(recovery_queue):
+            if not isinstance(row, dict):
+                issues.append(f"promotion recovery row {index} is not an object")
+                continue
+            for field in ("status", "copyRatesExportFreshnessStatus", "continuousSyncStatus"):
+                value = row.get(field)
+                if _release_blocking_status(value):
+                    label = runtime_recovery_label(row)
+                    issues.append(f"release recovery blocker {label}.{field}={value}")
+
+    integrity_blockers = payload.get("blockers")
+    if isinstance(integrity_blockers, list) and integrity_blockers:
+        issues.append(f"runtime integrity blockers remain: {len(integrity_blockers)}")
+
+    return list(dict.fromkeys(issues))
+
+
+def check_release_runtime_integrity(payload: dict[str, Any] | None) -> None:
+    issues = release_runtime_integrity_issues(payload)
+    if not issues:
+        print("OK: release runtime integrity and promotion gate are PASS")
+        return
+    for issue in issues:
+        print(f"FAIL: {issue}")
+    fail("release acceptance is blocked by runtime evidence")
+
+
 def cmd_test(ws: dict[str, Any]) -> None:
     """Run the cross-repo smoke test suite.
 
@@ -799,20 +914,97 @@ def cmd_build_frontend(ws: dict[str, Any]) -> None:
     run_frontend_build(repo_paths(ws)["frontend"])
 
 
+def _confined_repo_child(repo: pathlib.Path, raw: str, *, label: str) -> pathlib.Path:
+    root = repo.resolve()
+    raw_path = pathlib.Path(str(raw))
+    if raw_path.is_absolute():
+        fail(f"{label} must be relative to its repository: {raw}")
+    candidate = (root / raw_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        fail(f"{label} escapes its repository: {raw}")
+    if candidate == root:
+        fail(f"{label} must not target the repository root")
+    return candidate
+
+
+def _file_sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _directory_manifest(root: pathlib.Path) -> list[tuple[str, int, str]]:
+    rows: list[tuple[str, int, str]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            fail(f"frontend dist must not contain symlinks: {path}")
+        if not path.is_file():
+            continue
+        rows.append((path.relative_to(root).as_posix(), path.stat().st_size, _file_sha256(path)))
+    if not rows:
+        fail(f"frontend dist contains no files: {root}")
+    return rows
+
+
+def _rename_path(source: pathlib.Path, destination: pathlib.Path) -> None:
+    source.rename(destination)
+
+
 def cmd_sync_frontend_dist(ws: dict[str, Any]) -> None:
     if not ws.get("copyFrontendDistToBackend", True):
         print("frontend dist sync disabled by workspace config")
         return
 
     paths = repo_paths(ws)
-    frontend_dist = paths["frontend"] / str(ws.get("frontendDist", "dist"))
-    backend_dist = paths["backend"] / str(ws.get("backendVueDist", "Dashboard/vue-dist"))
+    frontend_dist = _confined_repo_child(
+        paths["frontend"],
+        str(ws.get("frontendDist", "dist")),
+        label="frontendDist",
+    )
+    backend_dist = _confined_repo_child(
+        paths["backend"],
+        str(ws.get("backendVueDist", "Dashboard/vue-dist")),
+        label="backendVueDist",
+    )
     if not frontend_dist.exists():
         fail(f"frontend dist missing; run build-frontend first: {frontend_dist}")
-    if backend_dist.exists():
-        shutil.rmtree(backend_dist)
-    shutil.copytree(frontend_dist, backend_dist)
-    print(f"synced {frontend_dist} -> {backend_dist}")
+    if not frontend_dist.is_dir():
+        fail(f"frontend dist is not a directory: {frontend_dist}")
+
+    source_manifest = _directory_manifest(frontend_dist)
+    backend_dist.parent.mkdir(parents=True, exist_ok=True)
+    operation_id = uuid.uuid4().hex
+    staging_dist = backend_dist.parent / f".{backend_dist.name}.staging-{operation_id}"
+    backup_dist = backend_dist.parent / f"{backend_dist.name}.previous-{operation_id}"
+    promoted_backup: pathlib.Path | None = None
+
+    try:
+        shutil.copytree(frontend_dist, staging_dist)
+        staged_manifest = _directory_manifest(staging_dist)
+        if staged_manifest != source_manifest:
+            fail("staged frontend dist failed SHA-256 manifest verification")
+
+        if backend_dist.exists():
+            _rename_path(backend_dist, backup_dist)
+            promoted_backup = backup_dist
+        try:
+            _rename_path(staging_dist, backend_dist)
+        except Exception:
+            if promoted_backup and promoted_backup.exists() and not backend_dist.exists():
+                _rename_path(promoted_backup, backend_dist)
+                promoted_backup = None
+            raise
+    finally:
+        if staging_dist.exists():
+            shutil.rmtree(staging_dist)
+
+    print(f"synced and verified {frontend_dist} -> {backend_dist}")
+    if promoted_backup:
+        print(f"previous frontend dist preserved at {promoted_backup}")
 
 
 def cmd_closed_loop(ws: dict[str, Any]) -> None:
@@ -842,14 +1034,18 @@ def check_path(path: pathlib.Path, should_exist: bool, label: str) -> bool:
     return ok
 
 
-def cmd_verify(ws: dict[str, Any]) -> None:
+def _verify_workspace(ws: dict[str, Any], *, release: bool) -> None:
+    mode_label = "release acceptance" if release else "integrity"
+    print(f"QuantGod workspace {mode_label} verify")
+    if not release:
+        print("NOTE: integrity verify does not authorize release or live execution; use verify-release for release acceptance.")
+
     paths = repo_paths(ws)
     assert_workspace_paths(paths)
     checks = [
         (paths["backend"] / "tools", True, "backend tools present"),
         (paths["backend"] / "MQL5", True, "backend MQL5 present"),
         (paths["backend"] / "frontend", False, "backend frontend source removed"),
-        (paths["backend"] / "cloudflare", False, "backend infra source removed"),
         (paths["frontend"] / "src", True, "frontend src present"),
         (paths["frontend"] / "Dashboard", False, "frontend has no backend Dashboard"),
         (paths["frontend"] / "MQL5", False, "frontend has no MQL5 source"),
@@ -870,23 +1066,53 @@ def cmd_verify(ws: dict[str, Any]) -> None:
     check_active_backend_live_lane(paths["backend"])
     check_legacy_quarantine(ws, paths)
     check_manifest_remotes(paths)
-    run_frontend_contract_guard(paths["frontend"])
-    run_docs_api_contract_strict(paths["docs"], paths["backend"])
-    run_backend_runtime_integrity_verify(paths["backend"])
+    run_frontend_contract_guard(paths["frontend"], required=release)
+    run_docs_api_contract_strict(paths["docs"], paths["backend"], required=release)
+    runtime_payload = run_backend_runtime_integrity_verify(paths["backend"], required=release)
     split_guard = paths["infra"] / "scripts" / "qg-split-path-guard.py"
     if split_guard.exists():
         run(
             ["python3", str(split_guard), "--root", str(paths["infra"].parent), "--include-codex-automations"],
             paths["infra"],
         )
-    print("QG_WORKSPACE_VERIFY_OK")
+    elif release:
+        fail(f"split path guard unavailable for release acceptance: {split_guard}")
+
+    if release:
+        check_release_runtime_integrity(runtime_payload)
+        print("QG_WORKSPACE_RELEASE_VERIFY_OK")
+    else:
+        print("QG_WORKSPACE_INTEGRITY_VERIFY_OK")
+        print("QG_WORKSPACE_VERIFY_OK")  # Backward-compatible marker.
+
+
+def cmd_verify(ws: dict[str, Any]) -> None:
+    """Backward-compatible integrity verification; this is not a release gate."""
+
+    _verify_workspace(ws, release=False)
+
+
+def cmd_verify_release(ws: dict[str, Any]) -> None:
+    """Fail-closed release acceptance; never grants trading execution authority."""
+
+    _verify_workspace(ws, release=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="QuantGod four-repo workspace helper")
     parser.add_argument(
         "command",
-        choices=["status", "pull", "test", "build-frontend", "sync-frontend-dist", "verify", "closed-loop"],
+        choices=[
+            "status",
+            "pull",
+            "test",
+            "build-frontend",
+            "sync-frontend-dist",
+            "verify",
+            "verify-integrity",
+            "verify-release",
+            "closed-loop",
+        ],
     )
     parser.add_argument("--workspace", default=DEFAULT_WORKSPACE)
     return parser
@@ -902,6 +1128,8 @@ def main() -> None:
         "build-frontend": cmd_build_frontend,
         "sync-frontend-dist": cmd_sync_frontend_dist,
         "verify": cmd_verify,
+        "verify-integrity": cmd_verify,
+        "verify-release": cmd_verify_release,
         "closed-loop": cmd_closed_loop,
     }[args.command](ws)
 

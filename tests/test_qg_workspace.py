@@ -106,6 +106,11 @@ class WorkspaceHelperTest(unittest.TestCase):
         args = parser.parse_args(["closed-loop", "--workspace", "workspace/quantgod.workspace.json"])
         self.assertEqual(args.command, "closed-loop")
 
+    def test_parser_exposes_integrity_and_release_verify_commands(self) -> None:
+        parser = qgw.build_parser()
+        self.assertEqual(parser.parse_args(["verify-integrity"]).command, "verify-integrity")
+        self.assertEqual(parser.parse_args(["verify-release"]).command, "verify-release")
+
     def test_closed_loop_runs_quality_build_sync_and_backend_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -117,6 +122,7 @@ class WorkspaceHelperTest(unittest.TestCase):
             (backend / "MQL5").mkdir()
             (frontend / "src").mkdir(parents=True)
             (frontend / "dist").mkdir()
+            (frontend / "dist" / "index.html").write_text("new frontend", encoding="utf-8")
             (infra / "scripts").mkdir(parents=True)
             (infra / "scripts" / "qg-workspace.py").write_text("", encoding="utf-8")
             (docs / "docs" / "architecture").mkdir(parents=True)
@@ -152,6 +158,89 @@ class WorkspaceHelperTest(unittest.TestCase):
             )
             self.assertTrue((backend / "Dashboard" / "vue-dist").exists())
 
+    def test_sync_frontend_dist_is_verified_atomic_and_preserves_previous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            backend = root / "QuantGodBackend"
+            frontend = root / "QuantGodFrontend"
+            infra = root / "QuantGodInfra"
+            docs = root / "QuantGodDocs"
+            frontend_dist = frontend / "dist"
+            backend_dist = backend / "Dashboard" / "vue-dist"
+            frontend_dist.mkdir(parents=True)
+            backend_dist.mkdir(parents=True)
+            infra.mkdir()
+            docs.mkdir()
+            (frontend_dist / "index.html").write_text("new frontend", encoding="utf-8")
+            (backend_dist / "index.html").write_text("old frontend", encoding="utf-8")
+            ws = {
+                "backend": str(backend),
+                "frontend": str(frontend),
+                "infra": str(infra),
+                "docs": str(docs),
+            }
+
+            qgw.cmd_sync_frontend_dist(ws)
+
+            self.assertEqual((backend_dist / "index.html").read_text(encoding="utf-8"), "new frontend")
+            backups = list((backend / "Dashboard").glob("vue-dist.previous-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual((backups[0] / "index.html").read_text(encoding="utf-8"), "old frontend")
+            self.assertEqual(list((backend / "Dashboard").glob(".vue-dist.staging-*")), [])
+
+    def test_sync_frontend_dist_restores_current_when_atomic_promotion_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            backend = root / "QuantGodBackend"
+            frontend = root / "QuantGodFrontend"
+            infra = root / "QuantGodInfra"
+            docs = root / "QuantGodDocs"
+            frontend_dist = frontend / "dist"
+            backend_dist = backend / "Dashboard" / "vue-dist"
+            frontend_dist.mkdir(parents=True)
+            backend_dist.mkdir(parents=True)
+            infra.mkdir()
+            docs.mkdir()
+            (frontend_dist / "index.html").write_text("new frontend", encoding="utf-8")
+            (backend_dist / "index.html").write_text("old frontend", encoding="utf-8")
+            ws = {
+                "backend": str(backend),
+                "frontend": str(frontend),
+                "infra": str(infra),
+                "docs": str(docs),
+            }
+            original_rename = qgw._rename_path
+
+            def fail_staging_promotion(source: pathlib.Path, destination: pathlib.Path) -> None:
+                if source.name.startswith(".vue-dist.staging-"):
+                    raise OSError("simulated atomic promotion failure")
+                original_rename(source, destination)
+
+            with mock.patch.object(qgw, "_rename_path", side_effect=fail_staging_promotion):
+                with self.assertRaisesRegex(OSError, "simulated atomic promotion failure"):
+                    qgw.cmd_sync_frontend_dist(ws)
+
+            self.assertEqual((backend_dist / "index.html").read_text(encoding="utf-8"), "old frontend")
+            self.assertEqual(list((backend / "Dashboard").glob(".vue-dist.staging-*")), [])
+
+    def test_sync_frontend_dist_rejects_paths_outside_repositories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for name in ("QuantGodBackend", "QuantGodFrontend", "QuantGodInfra", "QuantGodDocs"):
+                (root / name).mkdir()
+            (root / "QuantGodFrontend" / "dist").mkdir()
+            (root / "QuantGodFrontend" / "dist" / "index.html").write_text("ok", encoding="utf-8")
+            ws = {
+                "backend": str(root / "QuantGodBackend"),
+                "frontend": str(root / "QuantGodFrontend"),
+                "infra": str(root / "QuantGodInfra"),
+                "docs": str(root / "QuantGodDocs"),
+                "backendVueDist": "../outside",
+            }
+
+            with self.assertRaises(SystemExit):
+                qgw.cmd_sync_frontend_dist(ws)
+
     def test_cmd_verify_checks_split_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -173,9 +262,6 @@ class WorkspaceHelperTest(unittest.TestCase):
                 "docs": str(docs),
             }
             qgw.cmd_verify(ws)
-            (backend / "cloudflare").mkdir()
-            with self.assertRaises(SystemExit):
-                qgw.cmd_verify(ws)
 
     def test_cmd_verify_runs_split_path_guard_with_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -330,6 +416,108 @@ class WorkspaceHelperTest(unittest.TestCase):
         self.assertIn("command: python3 tools/run_usdjpy_strategy_backtest.py", text)
         self.assertIn("command: python3 tools/run_usdjpy_bar_replay.py", text)
         self.assertNotIn('"artifacts"', text)
+
+    def test_release_runtime_integrity_rejects_blocked_stale_and_missing(self) -> None:
+        payload = {
+            "status": "PASS",
+            "ok": True,
+            "promotionGateStatus": "BLOCKED",
+            "promotionGatePassed": False,
+            "promotionBlockers": ["historyProductionStatus:M1:freshness_not_ok"],
+            "promotionRecoveryQueue": [
+                {
+                    "kind": "history_freshness",
+                    "timeframe": "M1",
+                    "status": "FRESHNESS_STALE",
+                    "continuousSyncStatus": "MISSING",
+                }
+            ],
+            "blockers": [],
+        }
+
+        issues = qgw.release_runtime_integrity_issues(payload)
+        text = "\n".join(issues)
+
+        self.assertIn("promotion gate is not PASS", text)
+        self.assertIn("promotion blockers remain", text)
+        self.assertIn("FRESHNESS_STALE", text)
+        self.assertIn("continuousSyncStatus=MISSING", text)
+
+    def test_release_runtime_integrity_accepts_explicit_pass(self) -> None:
+        payload = {
+            "status": "PASS",
+            "ok": True,
+            "promotionGateStatus": "PASS",
+            "promotionGatePassed": True,
+            "promotionBlockers": [],
+            "promotionRecoveryQueue": [],
+            "blockers": [],
+        }
+
+        self.assertEqual(qgw.release_runtime_integrity_issues(payload), [])
+
+    def test_release_required_checks_fail_closed_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with self.assertRaises(SystemExit):
+                qgw.run_frontend_contract_guard(root / "frontend", required=True)
+            with self.assertRaises(SystemExit):
+                qgw.run_docs_api_contract_strict(root / "docs", root / "backend", required=True)
+            with self.assertRaises(SystemExit):
+                qgw.run_backend_runtime_integrity_verify(root / "backend", required=True)
+
+    def test_verify_release_command_fails_when_promotion_gate_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp).resolve()
+            backend = root / "QuantGodBackend"
+            frontend = root / "QuantGodFrontend"
+            infra = root / "QuantGodInfra"
+            docs = root / "QuantGodDocs"
+            (backend / "tools").mkdir(parents=True)
+            (backend / "MQL5").mkdir()
+            (backend / "tools" / "run_runtime_evidence_integrity.py").write_text("", encoding="utf-8")
+            (frontend / "src").mkdir(parents=True)
+            (frontend / "package.json").write_text(
+                json.dumps({"scripts": {"contract": "node scripts/frontend_api_contract_guard.mjs"}}),
+                encoding="utf-8",
+            )
+            (infra / "scripts").mkdir(parents=True)
+            (infra / "scripts" / "qg-workspace.py").write_text("", encoding="utf-8")
+            (infra / "scripts" / "qg-split-path-guard.py").write_text("", encoding="utf-8")
+            (docs / "docs" / "architecture").mkdir(parents=True)
+            (docs / "docs" / "architecture" / "repo-split.md").write_text("ok", encoding="utf-8")
+            (docs / "scripts").mkdir(parents=True)
+            (docs / "scripts" / "check_api_contract_matches_backend.py").write_text("", encoding="utf-8")
+            (docs / "docs" / "contracts").mkdir(parents=True)
+            (docs / "docs" / "contracts" / "api-contract.json").write_text("{}", encoding="utf-8")
+            ws = {
+                "backend": str(backend),
+                "frontend": str(frontend),
+                "infra": str(infra),
+                "docs": str(docs),
+            }
+            blocked_payload = json.dumps(
+                {
+                    "status": "PASS",
+                    "ok": True,
+                    "promotionGateStatus": "BLOCKED",
+                    "promotionGatePassed": False,
+                    "promotionBlockers": ["historyProductionStatus:M1:freshness_not_ok"],
+                    "promotionRecoveryQueue": [
+                        {"kind": "history_freshness", "timeframe": "M1", "status": "FRESHNESS_STALE"}
+                    ],
+                    "blockers": [],
+                }
+            )
+            runtime_result = mock.Mock(stdout=blocked_payload, returncode=0)
+
+            with mock.patch.object(qgw, "run"), mock.patch.object(
+                qgw,
+                "run_capture",
+                return_value=runtime_result,
+            ):
+                with self.assertRaises(SystemExit):
+                    qgw.cmd_verify_release(ws)
 
     def test_manifest_remote_issues_accept_current_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

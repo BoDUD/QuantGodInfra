@@ -17,18 +17,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
       - name: Python syntax check
         run: python -m py_compile scripts/qg-workspace.py
-      - name: Cloud sync uploader syntax check
-        run: node --check scripts/cloud-sync/cloud_sync_uploader.js
       - name: Unit tests
         run: python -m unittest discover tests -v
-      - name: Cloudflare worker tests
-        working-directory: tests
-        run: npm test
       - name: Workspace example is valid JSON
         run: python -m json.tool workspace/quantgod.workspace.example.json > /tmp/workspace.json
       - name: Workspace example is portable

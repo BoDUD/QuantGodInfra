@@ -16,7 +16,7 @@ OLD_PATH_PATTERNS = [
     re.compile(r"Desktop/Quard/QuantGod(?!Backend|Frontend|Infra|Docs)"),
     re.compile(r"cwds\s*=\s*\[\s*\"/Users/[^\"]*/Desktop/Quard/QuantGod\"\s*\]"),
     re.compile(r"C:\\QuantGod\\QuantGod(?!Backend|Frontend|Infra|Docs)"),
-    re.compile(r"QuantGod/(frontend|cloudflare|docs)(/|\b)"),
+    re.compile(r"QuantGod/(frontend|docs)(/|\b)"),
 ]
 
 SKIP_DIRS = {
