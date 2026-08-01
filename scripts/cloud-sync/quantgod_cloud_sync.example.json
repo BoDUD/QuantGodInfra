@@ -1,5 +1,0 @@
-{
-  "note": "Local-first default. Copy this file to quantgod_cloud_sync.enabled.json only when you explicitly want cloud sync.",
-  "endpoint": "https://quantgod-cloud.gao009629.workers.dev/api/ingest",
-  "token": "replace-with-your-ingest-token"
-}

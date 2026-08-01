@@ -2,7 +2,7 @@
 
 ## Repository role
 
-`QuantGodInfra` is responsible for: 四仓库联动、Cloudflare、workspace automation、dist 同步与部署脚本。
+`QuantGodInfra` is responsible for: 四仓库联动、纯本地 workspace automation、dist 同步与部署脚本。
 
 ## Repository boundaries
 
@@ -10,7 +10,7 @@ Keep changes inside the correct split repository:
 
 - Backend changes belong in `QuantGodBackend`.
 - Frontend UI and API client changes belong in `QuantGodFrontend`.
-- Workspace automation, deployment, Cloudflare, and sync helpers belong in `QuantGodInfra`.
+- Workspace automation, local deployment, and dist sync helpers belong in `QuantGodInfra`.
 - Architecture, API contracts, runbooks, phase docs, and maintenance docs belong in `QuantGodDocs`.
 
 ## Safety rules

@@ -8,7 +8,7 @@ This policy covers the QuantGod split repository workspace. The project is local
 
 - `QuantGodBackend`: backend API, MT5 bridge, AI, Governance, ParamLab, tests.
 - `QuantGodFrontend`: Vue operator workbench and API client.
-- `QuantGodInfra`: workspace automation, Cloudflare, deployment helpers.
+- `QuantGodInfra`: local workspace automation and deployment helpers.
 - `QuantGodDocs`: documentation, contracts, runbooks, phase status.
 
 ## Reporting
