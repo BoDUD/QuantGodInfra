@@ -38,6 +38,7 @@ CAPABILITY_PATH = STATUS_DIR / "launchd-capabilities.json"
 USER_DOMAIN = f"gui/{os.getuid()}"
 LABEL_PREFIX = "com.quantgod"
 MT5_EXPECTED_BROKER_SERVER = "HFMarketsGlobal-Live12"
+MT5_SECONDARY_EXPECTED_BROKER_SERVER = "HFMarketsGlobal-Live16"
 MT5_TERMINAL_PROCESS_PATTERN = (
     r"[/](wine64-preloader|wine-preloader|wine64|wine)[[:space:]]+"
     r"[t]erminal64\.exe([[:space:]]|$)"
@@ -72,6 +73,13 @@ SERVICES: dict[str, dict[str, Any]] = {
         "kind": "always",
         "throttle": 60,
         "description": "Strict single-instance MT5 Shadow/ReadOnly supervisor; Live is forbidden",
+    },
+    "mt5-secondary-shadow-supervisor": {
+        "label": f"{LABEL_PREFIX}.mt5-secondary-shadow-supervisor",
+        "wrapper": "quantgod-mt5-secondary-shadow-supervisor.sh",
+        "kind": "always",
+        "throttle": 60,
+        "description": "Strict secondary MT5 Shadow/ReadOnly supervisor for the isolated Live16 prefix",
     },
     "daily-autopilot": {
         "label": f"{LABEL_PREFIX}.daily-autopilot",
@@ -132,6 +140,17 @@ SERVICE_PROFILES: dict[str, tuple[str, ...]] = {
         "frontend-dist-build",
         "backend-api",
         "mt5-shadow-supervisor",
+        "usdjpy-history-sync",
+        "automation-chain",
+        "health-maintenance",
+        "log-maintenance",
+        "sqlite-backup",
+    ),
+    "local-dual-shadow": (
+        "frontend-dist-build",
+        "backend-api",
+        "mt5-shadow-supervisor",
+        "mt5-secondary-shadow-supervisor",
         "usdjpy-history-sync",
         "automation-chain",
         "health-maintenance",
@@ -336,6 +355,46 @@ def default_mt5_shadow_preset() -> Path:
     return default_mt5_root() / "MQL5/Presets/QuantGod_MT5_HFM_Shadow.set"
 
 
+def default_mt5_verified_ea_source() -> Path:
+    return default_mt5_prefix() / "drive_c/qg/QuantGod_MultiStrategy.mq5"
+
+
+def default_mt5_verified_ea_binary() -> Path:
+    return default_mt5_prefix() / "drive_c/qg/QuantGod_MultiStrategy.ex5"
+
+
+def default_mt5_verified_ea_compile_log() -> Path:
+    return default_mt5_prefix() / "drive_c/qg/compile.log"
+
+
+def default_mt5_secondary_prefix() -> Path:
+    return Path.home() / "Library/Application Support/net.metaquotes.wine.metatrader5-live16"
+
+
+def default_mt5_secondary_root() -> Path:
+    return default_mt5_secondary_prefix() / "drive_c/Program Files/MetaTrader 5"
+
+
+def default_mt5_secondary_files_dir() -> Path:
+    return default_mt5_secondary_root() / "MQL5/Files"
+
+
+def default_mt5_secondary_terminal_path() -> Path:
+    return default_mt5_secondary_root() / "terminal64.exe"
+
+
+def default_mt5_secondary_shadow_config() -> Path:
+    return default_mt5_secondary_prefix() / "drive_c/qg/QuantGod_MT5_HFM_SecondaryShadow_mac.ini"
+
+
+def default_mt5_secondary_login_reference_config() -> Path:
+    return default_mt5_secondary_prefix() / "drive_c/qg/QuantGod_MT5_LoginOnly_mac.ini"
+
+
+def default_mt5_secondary_shadow_preset() -> Path:
+    return default_mt5_secondary_root() / "MQL5/Presets/QuantGod_MT5_HFM_Shadow.set"
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -355,12 +414,15 @@ def shadow_preset_guard_issues(
     config: Path,
     preset: Path,
     login_reference: Path | None = None,
+    *,
+    expected_server: str = MT5_EXPECTED_BROKER_SERVER,
+    expected_config_name: str = "QuantGod_MT5_HFM_Shadow_mac.ini",
 ) -> list[str]:
     """Return non-secret reason codes when the installed MT5 lane is not strictly Shadow."""
 
     login_reference = login_reference or config.with_name("QuantGod_MT5_LoginOnly_mac.ini")
     issues: list[str] = []
-    if config.name != "QuantGod_MT5_HFM_Shadow_mac.ini":
+    if config.name != expected_config_name:
         issues.append("MT5_SHADOW_CONFIG_NAME_INVALID")
     if preset.name != "QuantGod_MT5_HFM_Shadow.set":
         issues.append("MT5_SHADOW_PRESET_NAME_INVALID")
@@ -379,9 +441,9 @@ def shadow_preset_guard_issues(
     preset_values = _read_key_value_lists(preset)
     login_reference_values = _read_key_value_lists(login_reference)
     broker_servers = config_values.get("server", [])
-    if broker_servers != [MT5_EXPECTED_BROKER_SERVER]:
+    if broker_servers != [expected_server]:
         issues.append("MT5_SHADOW_CONFIG_SERVER_INVALID")
-    if login_reference_values.get("server", []) != [MT5_EXPECTED_BROKER_SERVER]:
+    if login_reference_values.get("server", []) != [expected_server]:
         issues.append("MT5_LOGIN_REFERENCE_SERVER_INVALID")
     shadow_logins = config_values.get("login", [])
     reference_logins = login_reference_values.get("login", [])
@@ -480,7 +542,36 @@ def service_capability(
     elif name == "mt5-shadow-supervisor":
         require(default_mt5_wine_bin(), "MT5_WINE_MISSING", executable=True)
         require(default_mt5_terminal_path(), "MT5_TERMINAL_MISSING")
+        require(default_mt5_root() / "MQL5/Experts/QuantGod_MultiStrategy.mq5", "MT5_SHADOW_EA_SOURCE_MISSING")
+        require(default_mt5_root() / "MQL5/Experts/QuantGod_MultiStrategy.ex5", "MT5_SHADOW_EA_BINARY_MISSING")
+        require(default_mt5_verified_ea_source(), "MT5_VERIFIED_EA_SOURCE_MISSING")
+        require(default_mt5_verified_ea_binary(), "MT5_VERIFIED_EA_BINARY_MISSING")
+        require(default_mt5_verified_ea_compile_log(), "MT5_VERIFIED_EA_COMPILE_LOG_MISSING")
         issues.extend(shadow_preset_guard_issues(default_mt5_shadow_config(), default_mt5_shadow_preset()))
+        issues.extend(local_user_environment_issues())
+    elif name == "mt5-secondary-shadow-supervisor":
+        require(default_mt5_wine_bin(), "MT5_WINE_MISSING", executable=True)
+        require(default_mt5_secondary_terminal_path(), "MT5_SECONDARY_TERMINAL_MISSING")
+        require(
+            default_mt5_secondary_root() / "MQL5/Experts/QuantGod_MultiStrategy.mq5",
+            "MT5_SECONDARY_SHADOW_EA_SOURCE_MISSING",
+        )
+        require(
+            default_mt5_secondary_root() / "MQL5/Experts/QuantGod_MultiStrategy.ex5",
+            "MT5_SECONDARY_SHADOW_EA_BINARY_MISSING",
+        )
+        require(default_mt5_verified_ea_source(), "MT5_VERIFIED_EA_SOURCE_MISSING")
+        require(default_mt5_verified_ea_binary(), "MT5_VERIFIED_EA_BINARY_MISSING")
+        require(default_mt5_verified_ea_compile_log(), "MT5_VERIFIED_EA_COMPILE_LOG_MISSING")
+        issues.extend(
+            shadow_preset_guard_issues(
+                default_mt5_secondary_shadow_config(),
+                default_mt5_secondary_shadow_preset(),
+                default_mt5_secondary_login_reference_config(),
+                expected_server=MT5_SECONDARY_EXPECTED_BROKER_SERVER,
+                expected_config_name="QuantGod_MT5_HFM_SecondaryShadow_mac.ini",
+            )
+        )
         issues.extend(local_user_environment_issues())
     elif name == "usdjpy-history-sync":
         require(backend / "tools/run_usdjpy_strategy_backtest.py", "HISTORY_SYNC_RUNNER_MISSING")
@@ -545,7 +636,12 @@ def build_capability_report(
     }
 
 
-def render_env(paths: dict[str, Path], *, workspace: Path = DEFAULT_WORKSPACE) -> str:
+def render_env(
+    paths: dict[str, Path],
+    *,
+    workspace: Path = DEFAULT_WORKSPACE,
+    secondary_shadow_enabled: bool = False,
+) -> str:
     mt5_files = default_mt5_files_dir()
     python_bin = which("python3", "/usr/bin/python3")
     runtime_dir = mt5_files if mt5_files.exists() else paths["backend"] / "Dashboard"
@@ -571,13 +667,34 @@ def render_env(paths: dict[str, Path], *, workspace: Path = DEFAULT_WORKSPACE) -
         "QG_MT5_SHADOW_CONFIG": str(default_mt5_shadow_config()),
         "QG_MT5_LOGIN_REFERENCE_CONFIG": str(default_mt5_login_reference_config()),
         "QG_MT5_SHADOW_PRESET": str(default_mt5_shadow_preset()),
+        "QG_MT5_VERIFIED_EA_SOURCE": str(default_mt5_verified_ea_source()),
+        "QG_MT5_VERIFIED_EA_BINARY": str(default_mt5_verified_ea_binary()),
+        "QG_MT5_VERIFIED_EA_COMPILE_LOG": str(default_mt5_verified_ea_compile_log()),
         "QG_MT5_SHADOW_CONFIG_WINDOWS": r"C:\qg\QuantGod_MT5_HFM_Shadow_mac.ini",
         "QG_MT5_EXPECTED_SERVER": MT5_EXPECTED_BROKER_SERVER,
+        "QG_MT5_PEER_ROOT": str(default_mt5_secondary_root()),
+        "QG_MT5_PEER_TERMINAL_PATH": str(default_mt5_secondary_terminal_path()),
+        "QG_MT5_PEER_SHADOW_CONFIG_WINDOWS": r"C:\qg\QuantGod_MT5_HFM_SecondaryShadow_mac.ini",
         "QG_EXECUTION_MODE": "SHADOW",
         "QG_MT5_START_MODE": "shadow",
         "QG_MT5_LIVE_LAUNCH_ALLOWED": "0",
         "QG_MT5_SECONDARY_ENABLED": "0",
+        "QG_MT5_SECONDARY_SHADOW_ENABLED": "1" if secondary_shadow_enabled else "0",
         "QG_MT5_SECONDARY_ALLOW_LIVE_TRADING": "0",
+        "QG_MT5_SECONDARY_WINE_PREFIX": str(default_mt5_secondary_prefix()),
+        "QG_MT5_SECONDARY_ROOT": str(default_mt5_secondary_root()),
+        "QG_MT5_SECONDARY_FILES_DIR": str(default_mt5_secondary_files_dir()),
+        "QG_MT5_SECONDARY_TERMINAL_PATH": str(default_mt5_secondary_terminal_path()),
+        "QG_MT5_SECONDARY_SHADOW_CONFIG": str(default_mt5_secondary_shadow_config()),
+        "QG_MT5_SECONDARY_LOGIN_REFERENCE_CONFIG": str(
+            default_mt5_secondary_login_reference_config()
+        ),
+        "QG_MT5_SECONDARY_SHADOW_PRESET": str(default_mt5_secondary_shadow_preset()),
+        "QG_MT5_SECONDARY_SHADOW_CONFIG_WINDOWS": r"C:\qg\QuantGod_MT5_HFM_SecondaryShadow_mac.ini",
+        "QG_MT5_SECONDARY_EXPECTED_SERVER": MT5_SECONDARY_EXPECTED_BROKER_SERVER,
+        "QG_MT5_SECONDARY_PEER_ROOT": str(default_mt5_root()),
+        "QG_MT5_SECONDARY_PEER_TERMINAL_PATH": str(default_mt5_terminal_path()),
+        "QG_MT5_SECONDARY_PEER_SHADOW_CONFIG_WINDOWS": r"C:\qg\QuantGod_MT5_HFM_Shadow_mac.ini",
         "QG_ORDER_SEND_ALLOWED": "0",
         "QG_BROKER_EXECUTION_ALLOWED": "0",
         "QG_LIVE_PRESET_MUTATION_ALLOWED": "0",
@@ -876,6 +993,8 @@ enforce_shadow_contract() {
   assert_shadow_env_value "QG_MT5_START_MODE" "shadow"
   assert_shadow_env_value "QG_MT5_LIVE_LAUNCH_ALLOWED" "0"
   assert_shadow_env_value "QG_MT5_SECONDARY_ENABLED" "0"
+  [[ "${QG_MT5_SECONDARY_SHADOW_ENABLED-}" =~ ^[01]$ ]] || \
+    block_service "SHADOW_ENV_GUARD_FAILED" "QG_MT5_SECONDARY_SHADOW_ENABLED must equal 0 or 1"
   assert_shadow_env_value "QG_MT5_SECONDARY_ALLOW_LIVE_TRADING" "0"
   assert_shadow_env_value "QG_ORDER_SEND_ALLOWED" "0"
   assert_shadow_env_value "QG_BROKER_EXECUTION_ALLOWED" "0"
@@ -1014,6 +1133,28 @@ for candidate in (path, *path.parents):
 PY
   then
     block_service "PRIVATE_PATH_SYMLINK_FORBIDDEN" "managed private path contains a symlink component"
+  fi
+}
+
+assert_private_identity_file() {
+  local path="$1"
+  if ! "$QG_PYTHON_BIN" - "$path" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+metadata = path.lstat()
+if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    raise SystemExit(1)
+if metadata.st_uid != os.getuid():
+    raise SystemExit(1)
+if stat.S_IMODE(metadata.st_mode) & 0o077:
+    raise SystemExit(1)
+PY
+  then
+    block_service "MT5_PRIVATE_IDENTITY_FILE_INVALID" "private MT5 identity/config file ownership or permissions are unsafe"
   fi
 }
 
@@ -1187,6 +1328,32 @@ require_file "$QG_MT5_TERMINAL_PATH" "MT5_TERMINAL_MISSING"
 require_file "$QG_MT5_SHADOW_CONFIG" "MT5_SHADOW_CONFIG_MISSING"
 require_file "$QG_MT5_LOGIN_REFERENCE_CONFIG" "MT5_LOGIN_REFERENCE_MISSING"
 require_file "$QG_MT5_SHADOW_PRESET" "MT5_SHADOW_PRESET_MISSING"
+require_file "$QG_MT5_ROOT/MQL5/Experts/QuantGod_MultiStrategy.mq5" "MT5_SHADOW_EA_SOURCE_MISSING"
+require_file "$QG_MT5_ROOT/MQL5/Experts/QuantGod_MultiStrategy.ex5" "MT5_SHADOW_EA_BINARY_MISSING"
+require_file "$QG_MT5_VERIFIED_EA_SOURCE" "MT5_VERIFIED_EA_SOURCE_MISSING"
+require_file "$QG_MT5_VERIFIED_EA_BINARY" "MT5_VERIFIED_EA_BINARY_MISSING"
+require_file "$QG_MT5_VERIFIED_EA_COMPILE_LOG" "MT5_VERIFIED_EA_COMPILE_LOG_MISSING"
+for reviewed_path in \
+  "$QG_MT5_WINE_PREFIX" \
+  "$QG_MT5_ROOT" \
+  "$QG_MT5_TERMINAL_PATH" \
+  "$QG_MT5_SHADOW_CONFIG" \
+  "$QG_MT5_LOGIN_REFERENCE_CONFIG" \
+  "$QG_MT5_SHADOW_PRESET" \
+  "$QG_MT5_ROOT/MQL5/Experts/QuantGod_MultiStrategy.mq5" \
+  "$QG_MT5_ROOT/MQL5/Experts/QuantGod_MultiStrategy.ex5" \
+  "$QG_MT5_VERIFIED_EA_SOURCE" \
+  "$QG_MT5_VERIFIED_EA_BINARY" \
+  "$QG_MT5_VERIFIED_EA_COMPILE_LOG"; do
+  assert_path_has_no_symlink_components "$reviewed_path"
+done
+if [[ "$QG_MT5_SECONDARY_SHADOW_ENABLED" == "1" ]]; then
+  require_file "$QG_MT5_PEER_TERMINAL_PATH" "MT5_PEER_TERMINAL_MISSING"
+  assert_path_has_no_symlink_components "$QG_MT5_PEER_ROOT"
+  assert_path_has_no_symlink_components "$QG_MT5_PEER_TERMINAL_PATH"
+fi
+assert_private_identity_file "$QG_MT5_SHADOW_CONFIG"
+assert_private_identity_file "$QG_MT5_LOGIN_REFERENCE_CONFIG"
 expected_shadow_config="$QG_MT5_WINE_PREFIX/drive_c/qg/QuantGod_MT5_HFM_Shadow_mac.ini"
 expected_login_reference="$QG_MT5_WINE_PREFIX/drive_c/qg/QuantGod_MT5_LoginOnly_mac.ini"
 expected_shadow_preset="$QG_MT5_ROOT/MQL5/Presets/QuantGod_MT5_HFM_Shadow.set"
@@ -1212,19 +1379,153 @@ assert_file_value_not_true "$QG_MT5_SHADOW_PRESET" "OrderSendAllowed"
 assert_file_value_not_true "$QG_MT5_SHADOW_PRESET" "BrokerExecutionAllowed"
 assert_file_value_not_true "$QG_MT5_SHADOW_PRESET" "LivePresetMutationAllowed"
 assert_file_value_not_true "$QG_MT5_SHADOW_PRESET" "EnableLiveTrading"
-find_mt5_terminal_pids() {
-  # Match the executable/first Wine payload pair, not unrelated argv values such
-  # as history-sync's --terminal-path /.../terminal64.exe option.
-  pgrep -f '__MT5_TERMINAL_PROCESS_PATTERN__'
+if ! "$QG_PYTHON_BIN" - \
+  "$QG_MT5_ROOT/MQL5/Experts/QuantGod_MultiStrategy.mq5" \
+  "$QG_MT5_ROOT/MQL5/Experts/QuantGod_MultiStrategy.ex5" \
+  "$QG_MT5_VERIFIED_EA_SOURCE" \
+  "$QG_MT5_VERIFIED_EA_BINARY" \
+  "$QG_MT5_VERIFIED_EA_COMPILE_LOG" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import hmac
+import re
+import sys
+
+lane_source, lane_binary, verified_source, verified_binary, compile_log = map(Path, sys.argv[1:])
+
+def digest(path: Path) -> str:
+    value = sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+source_text = lane_source.read_text(encoding="utf-8-sig", errors="strict")
+for pattern in (
+    r"#include\s*<Trade/Trade\.mqh>",
+    r"\bCTrade\b|\bg_trade\b",
+    r"\bOrderSend(?:Async)?\s*\(",
+    r"\.(?:Buy|Sell|PositionClose|PositionModify|OrderDelete|OrderModify)\s*\(",
+    r"TRADE_ACTION_(?:DEAL|PENDING|SLTP|MODIFY|REMOVE)",
+):
+    if re.search(pattern, source_text):
+        raise SystemExit("the installed EA source exposes broker mutation")
+
+for installed, verified in ((lane_source, verified_source), (lane_binary, verified_binary)):
+    if not hmac.compare_digest(digest(installed), digest(verified)):
+        raise SystemExit("the installed EA does not match the verified build staging artifact")
+
+raw_log = compile_log.read_bytes()
+encoding = "utf-16" if raw_log.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+log_text = raw_log.decode(encoding, errors="strict")
+if re.search(r"^\s*Result:\s*0 errors,\s*0 warnings(?:,|$)", log_text, flags=re.MULTILINE) is None:
+    raise SystemExit("the verified EA compile log is not clean")
+normalized_log = log_text.replace("/", "\\")
+if re.search(
+    r"^C:\\qg\\QuantGod_MultiStrategy\.mq5\s+:\s+information:\s+compiling\s+"
+    r"C:\\qg\\QuantGod_MultiStrategy\.mq5\s*$",
+    normalized_log,
+    flags=re.MULTILINE,
+) is None:
+    raise SystemExit("the verified EA compile log does not identify the reviewed staging source")
+for pattern in (
+    r"Trade[/\\]Trade\.mqh",
+    r"\bCTrade\b|\bg_trade\b",
+    r"\bOrderSend(?:Async)?\s*\(",
+    r"TRADE_ACTION_(?:DEAL|PENDING|SLTP|MODIFY|REMOVE)",
+):
+    if re.search(pattern, log_text):
+        raise SystemExit("the verified EA compile log references a broker mutation surface")
+
+source_mtime = verified_source.stat().st_mtime_ns
+binary_mtime = verified_binary.stat().st_mtime_ns
+log_mtime = compile_log.stat().st_mtime_ns
+if binary_mtime < source_mtime or log_mtime < source_mtime:
+    raise SystemExit("the verified EA binary or compile log predates the reviewed source")
+if abs(binary_mtime - log_mtime) > 120 * 1_000_000_000:
+    raise SystemExit("the verified EA binary and compile log timestamps do not form one build event")
+PY
+then
+  block_service "MT5_SHADOW_EA_PROVENANCE_INVALID" "the installed Shadow EA failed source/build provenance validation"
+fi
+if [[ "$QG_MT5_SECONDARY_SHADOW_ENABLED" == "1" ]] && \
+   ! "$QG_PYTHON_BIN" - "$QG_MT5_TERMINAL_PATH" "$QG_MT5_PEER_TERMINAL_PATH" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import hmac
+import sys
+
+def digest(path: str) -> str:
+    target = Path(path)
+    with target.open("rb") as stream:
+        value = sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+if not hmac.compare_digest(digest(sys.argv[1]), digest(sys.argv[2])):
+    raise SystemExit("the reviewed MT5 terminal binaries differ")
+PY
+then
+  block_service "MT5_TERMINAL_BINARY_MISMATCH" "the two reviewed Wine prefixes do not use the same terminal binary"
+fi
+find_mt5_terminal_pids_for_root() {
+  # Two reviewed Wine prefixes may run side by side.  Classify the terminal by
+  # its current working directory so a process in the peer prefix is allowed,
+  # while a duplicate in this prefix or an unknown third MT5 is rejected.
+  local process_list="" process_rc=0 pid="" cwd_record="" cwd="" command_line="" found_same=0
+  if process_list="$(pgrep -f '__MT5_TERMINAL_PROCESS_PATTERN__')"; then
+    :
+  else
+    process_rc=$?
+    [[ "$process_rc" -eq 1 ]] && return 1
+    return 2
+  fi
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 3
+    if cwd_record="$(/usr/sbin/lsof -a -p "$pid" -d cwd -Fn 2>/dev/null)"; then
+      cwd="$(printf '%s\n' "$cwd_record" | awk '/^n/ {print substr($0, 2); exit}')"
+    else
+      kill -0 "$pid" 2>/dev/null || continue
+      return 3
+    fi
+    [[ -n "$cwd" ]] || return 3
+    if ! command_line="$(/bin/ps -p "$pid" -o command= 2>/dev/null)"; then
+      kill -0 "$pid" 2>/dev/null || continue
+      return 3
+    fi
+    if [[ "$cwd" == "$QG_MT5_ROOT" ]]; then
+      [[ "$command_line" == *"/config:${QG_MT5_SHADOW_CONFIG_WINDOWS}"* ]] || return 4
+      printf '%s\n' "$pid"
+      found_same=1
+    elif [[ "$cwd" == "$QG_MT5_PEER_ROOT" ]]; then
+      [[ "$QG_MT5_SECONDARY_SHADOW_ENABLED" == "1" ]] || return 4
+      [[ "$command_line" == *"/config:${QG_MT5_PEER_SHADOW_CONFIG_WINDOWS}"* ]] || return 4
+    else
+      return 4
+    fi
+  done <<< "$process_list"
+  [[ "$found_same" -eq 1 ]]
 }
 existing_mt5=""
-if existing_mt5="$(find_mt5_terminal_pids)"; then
-  block_service "EXISTING_MT5_PROCESS" "an MT5 terminal already exists; refusing a second instance"
+if existing_mt5="$(find_mt5_terminal_pids_for_root)"; then
+  block_service "EXISTING_MT5_PROCESS" "an MT5 terminal already exists in this Wine prefix"
 else
   pgrep_rc=$?
-  [[ "$pgrep_rc" -eq 1 ]] || block_service "MT5_PROCESS_QUERY_FAILED" "could not safely determine whether MT5 is already running"
+  case "$pgrep_rc" in
+    1) ;;
+    2|3) block_service "MT5_PROCESS_QUERY_FAILED" "could not safely identify an existing MT5 terminal" ;;
+    4) block_service "UNREVIEWED_MT5_PROCESS" "an MT5 terminal outside the two reviewed Wine prefixes is running" ;;
+    *) block_service "MT5_PROCESS_QUERY_FAILED" "unexpected MT5 process query result" ;;
+  esac
 fi
 require_directory "$QG_MT5_ROOT" "MT5_ROOT_MISSING"
+current_root_real="$(canonical_directory "$QG_MT5_ROOT")" || block_service "MT5_ROOT_INVALID" "the MT5 root could not be resolved"
+if [[ "$QG_MT5_SECONDARY_SHADOW_ENABLED" == "1" ]]; then
+  require_directory "$QG_MT5_PEER_ROOT" "MT5_PEER_ROOT_MISSING"
+  peer_root_real="$(canonical_directory "$QG_MT5_PEER_ROOT")" || block_service "MT5_PEER_ROOT_INVALID" "the peer MT5 root could not be resolved"
+  [[ "$current_root_real" != "$peer_root_real" ]] || block_service "MT5_PREFIX_COLLISION" "primary and secondary MT5 roots must be distinct"
+fi
 prepare_wine_user_environment
 cd "$QG_MT5_ROOT"
 export WINEPREFIX="$QG_MT5_WINE_PREFIX"
@@ -1279,15 +1580,17 @@ if [[ "$QG_MT5_SIGNAL_FORWARD_FAILED" -ne 0 ]]; then
 fi
 
 detached_mt5=""
-if detached_mt5="$(find_mt5_terminal_pids)"; then
+if detached_mt5="$(find_mt5_terminal_pids_for_root)"; then
   finish_service "FAILED" "MT5_CHILD_DETACHED" "the supervised Wine child exited while an MT5 terminal remained"
   exit 70
 else
   detached_query_rc=$?
-  if [[ "$detached_query_rc" -ne 1 ]]; then
-    finish_service "FAILED" "MT5_PROCESS_QUERY_FAILED" "could not verify terminal shutdown after the supervised child exited"
-    exit 70
-  fi
+  case "$detached_query_rc" in
+    1) ;;
+    2|3) finish_service "FAILED" "MT5_PROCESS_QUERY_FAILED" "could not verify terminal shutdown after the supervised child exited"; exit 70 ;;
+    4) finish_service "FAILED" "UNREVIEWED_MT5_PROCESS" "an MT5 terminal outside the two reviewed Wine prefixes is running"; exit 70 ;;
+    *) finish_service "FAILED" "MT5_PROCESS_QUERY_FAILED" "unexpected MT5 process query result"; exit 70 ;;
+  esac
 fi
 
 if [[ -n "$QG_MT5_STOP_SIGNAL" ]]; then
@@ -1672,6 +1975,43 @@ exec "$QG_PYTHON_BIN" tools/run_mt5_ai_telegram_monitor.py scan-once \
   --min-interval-seconds "${QG_MT5_AI_MONITOR_MIN_INTERVAL_SECONDS:-900}"
 ''',
     }
+    primary_mt5_wrapper = wrappers["quantgod-mt5-shadow-supervisor.sh"]
+    secondary_mt5_wrapper = primary_mt5_wrapper.replace(
+        'QG_SERVICE_NAME="mt5-shadow-supervisor"',
+        'QG_SERVICE_NAME="mt5-secondary-shadow-supervisor"',
+        1,
+    ).replace(
+        f"[[ \"$QG_MT5_EXPECTED_SERVER\" == '{MT5_EXPECTED_BROKER_SERVER}' ]]",
+        f"[[ \"$QG_MT5_EXPECTED_SERVER\" == '{MT5_SECONDARY_EXPECTED_BROKER_SERVER}' ]]",
+        1,
+    ).replace(
+        "QuantGod_MT5_HFM_Shadow_mac.ini",
+        "QuantGod_MT5_HFM_SecondaryShadow_mac.ini",
+    )
+    secondary_aliases = r'''
+[[ "$QG_MT5_SECONDARY_SHADOW_ENABLED" == "1" ]] || block_service "MT5_SECONDARY_SHADOW_DISABLED" "the optional secondary Shadow observer is not enabled by this profile"
+QG_MT5_WINE_PREFIX="$QG_MT5_SECONDARY_WINE_PREFIX"
+QG_MT5_ROOT="$QG_MT5_SECONDARY_ROOT"
+QG_MT5_TERMINAL_PATH="$QG_MT5_SECONDARY_TERMINAL_PATH"
+QG_MT5_SHADOW_CONFIG="$QG_MT5_SECONDARY_SHADOW_CONFIG"
+QG_MT5_LOGIN_REFERENCE_CONFIG="$QG_MT5_SECONDARY_LOGIN_REFERENCE_CONFIG"
+QG_MT5_SHADOW_PRESET="$QG_MT5_SECONDARY_SHADOW_PRESET"
+QG_MT5_SHADOW_CONFIG_WINDOWS="$QG_MT5_SECONDARY_SHADOW_CONFIG_WINDOWS"
+QG_MT5_EXPECTED_SERVER="$QG_MT5_SECONDARY_EXPECTED_SERVER"
+QG_MT5_PEER_ROOT="$QG_MT5_SECONDARY_PEER_ROOT"
+QG_MT5_PEER_TERMINAL_PATH="$QG_MT5_SECONDARY_PEER_TERMINAL_PATH"
+QG_MT5_PEER_SHADOW_CONFIG_WINDOWS="$QG_MT5_SECONDARY_PEER_SHADOW_CONFIG_WINDOWS"
+'''
+    supervisor_start = 'require_executable "$QG_MT5_WINE_BIN" "MT5_WINE_MISSING"'
+    if supervisor_start not in secondary_mt5_wrapper:
+        raise RuntimeError("MT5 supervisor template start marker is missing")
+    secondary_mt5_wrapper = secondary_mt5_wrapper.replace(
+        supervisor_start,
+        secondary_aliases + supervisor_start,
+        1,
+    )
+    wrappers["quantgod-mt5-secondary-shadow-supervisor.sh"] = secondary_mt5_wrapper
+
     return {
         name: content.replace("__MT5_TERMINAL_PROCESS_PATTERN__", MT5_TERMINAL_PROCESS_PATTERN)
         for name, content in wrappers.items()
@@ -1699,16 +2039,28 @@ def render_plist(service: dict[str, Any]) -> dict[str, Any]:
             "PYTHONIOENCODING": "utf-8",
         },
     }
-    if label == SERVICES["mt5-shadow-supervisor"]["label"]:
+    mt5_labels = {
+        SERVICES["mt5-shadow-supervisor"]["label"],
+        SERVICES["mt5-secondary-shadow-supervisor"]["label"],
+    }
+    if label in mt5_labels:
         wine_user_environment = local_user_environment()
         issues = local_user_environment_issues(wine_user_environment)
         if issues:
             raise ValueError("invalid MT5 Wine user environment: " + ",".join(issues))
         payload["EnvironmentVariables"].update(wine_user_environment)
-        payload["EnvironmentVariables"]["QG_MT5_EXPECTED_SERVER"] = MT5_EXPECTED_BROKER_SERVER
-        payload["EnvironmentVariables"]["QG_MT5_LOGIN_REFERENCE_CONFIG"] = str(
-            default_mt5_login_reference_config()
-        )
+        if label == SERVICES["mt5-shadow-supervisor"]["label"]:
+            payload["EnvironmentVariables"]["QG_MT5_EXPECTED_SERVER"] = MT5_EXPECTED_BROKER_SERVER
+            payload["EnvironmentVariables"]["QG_MT5_LOGIN_REFERENCE_CONFIG"] = str(
+                default_mt5_login_reference_config()
+            )
+        else:
+            payload["EnvironmentVariables"]["QG_MT5_SECONDARY_EXPECTED_SERVER"] = (
+                MT5_SECONDARY_EXPECTED_BROKER_SERVER
+            )
+            payload["EnvironmentVariables"]["QG_MT5_SECONDARY_LOGIN_REFERENCE_CONFIG"] = str(
+                default_mt5_secondary_login_reference_config()
+            )
     if service["kind"] == "keepalive":
         payload["KeepAlive"] = {"SuccessfulExit": False}
     elif service["kind"] == "always":
@@ -1926,7 +2278,12 @@ def selected_capability_blockers(
     return blocked
 
 
-def write_files(workspace: Path, *, resolved_paths: dict[str, Path] | None = None) -> dict[str, Path]:
+def write_files(
+    workspace: Path,
+    *,
+    resolved_paths: dict[str, Path] | None = None,
+    secondary_shadow_enabled: bool = False,
+) -> dict[str, Path]:
     paths = resolved_paths or load_workspace(workspace)
     harden_private_directory(PRIVATE_ROOT)
     harden_private_directory(BIN_DIR)
@@ -1937,7 +2294,15 @@ def write_files(workspace: Path, *, resolved_paths: dict[str, Path] | None = Non
     LAUNCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
     if ENV_PATH.is_symlink():
         raise RuntimeError(f"refusing symlink for QuantGod private environment: {ENV_PATH}")
-    atomic_write_text(ENV_PATH, render_env(paths, workspace=workspace), PRIVATE_FILE_MODE)
+    atomic_write_text(
+        ENV_PATH,
+        render_env(
+            paths,
+            workspace=workspace,
+            secondary_shadow_enabled=secondary_shadow_enabled,
+        ),
+        PRIVATE_FILE_MODE,
+    )
     for name, content in render_wrappers().items():
         write_executable(BIN_DIR / name, content)
     for service in SERVICES.values():
@@ -2054,7 +2419,11 @@ def install(args: argparse.Namespace) -> int:
                     for row in blocked
                 )
                 raise RuntimeError("frontend publication completed but final capability preflight is blocked: " + details)
-        write_files(args.workspace, resolved_paths=paths)
+        write_files(
+            args.workspace,
+            resolved_paths=paths,
+            secondary_shadow_enabled="mt5-secondary-shadow-supervisor" in runtime_selected_names,
+        )
         for label in selected_labels:
             bootstrap(label)
             loaded_labels.append(label)

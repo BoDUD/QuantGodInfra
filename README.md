@@ -78,11 +78,13 @@ python3 scripts/qg-macos-launchd.py status
 ```
 
 The default `core` profile loads only the local Backend and Vite development
-Frontend. The production-style local profile is `local-shadow`. Preflight and
+Frontend. The production-style single-account profile is `local-shadow`; the
+optional two-prefix observer profile is `local-dual-shadow`. Preflight and
 inspect it without changing any managed file or loaded service first:
 
 ```bash
 python3 scripts/qg-macos-launchd.py --workspace workspace/quantgod.workspace.json install --profile local-shadow --no-load
+python3 scripts/qg-macos-launchd.py --workspace workspace/quantgod.workspace.json install --profile local-dual-shadow --no-load
 python3 scripts/qg-macos-launchd.py --workspace workspace/quantgod.workspace.json doctor
 ```
 
@@ -104,7 +106,7 @@ and verified local SQLite backup. The MT5 wrapper accepts only
 `QuantGod_MT5_HFM_Shadow_mac.ini` plus `QuantGod_MT5_HFM_Shadow.set`, verifies
 the config contains exactly one `Server=HFMarketsGlobal-Live12`, verifies
 `AllowLiveTrading=0`, `ShadowMode=true`, `ReadOnlyMode=true`, and
-`EnablePilotAutoTrading=false`, and refuses to launch a second MT5 terminal.
+`EnablePilotAutoTrading=false`, and refuses a duplicate or unreviewed MT5 terminal.
 The generated private env and MT5 plist pin the same non-secret expected-server
 value; capability preflight and the final wrapper check both fail closed on a
 missing, duplicate, differently-cased, or synthetic server. Login and password
@@ -133,6 +135,18 @@ the supervisor never uses broad `pkill` or kills an unrelated MT5 process.
 Both the pre-launch duplicate check and post-exit detach check require a Wine
 launcher/preloader whose immediate payload is `terminal64.exe`; a Python worker
 that merely carries `--terminal-path /.../terminal64.exe` is not an MT5 process.
+`local-dual-shadow` adds an isolated Live16 observer with the unique
+`QuantGod_MT5_HFM_SecondaryShadow_mac.ini` signature. Each supervisor classifies
+processes by canonical Wine-prefix root and exact config argument, permits only
+the other reviewed prefix, and keeps separate singleton/status files. Installed
+EA source and binary must match the same clean verified build staging artifacts;
+the source is scanned for Trade.mqh, CTrade, OrderSend, and raw trade actions
+before either terminal starts. The private `drive_c/qg/compile.log` must identify
+the reviewed staging source, report zero errors and warnings, contain no broker
+mutation surface, and belong to the same build-time window as the staged binary.
+The legacy `QG_MT5_SECONDARY_ENABLED` execution
+switch stays `0`; only the read-only `QG_MT5_SECONDARY_SHADOW_ENABLED` observer
+flag becomes `1` in this profile.
 An existing singleton lock is reclaimed only when all owner identity fields are
 complete and the recorded process identity is stale. Empty or partially written
 locks are treated as in-progress/unsafe and block instead of being deleted.
@@ -152,6 +166,7 @@ Generated agents:
 | `com.quantgod.frontend-dev` | Vite workbench at `http://127.0.0.1:5173/vue/` |
 | `com.quantgod.frontend-dist-build` | Build Frontend and atomically publish it to Backend `Dashboard/vue-dist/` |
 | `com.quantgod.mt5-shadow-supervisor` | Single-instance MT5 supervisor locked to the reviewed Shadow/ReadOnly config |
+| `com.quantgod.mt5-secondary-shadow-supervisor` | Optional isolated Live16 observer locked to a distinct Shadow/ReadOnly config; enabled only by `local-dual-shadow` |
 | `com.quantgod.daily-autopilot` | Deprecated compatibility definition; explicitly `BLOCKED` until stage failures propagate non-zero |
 | `com.quantgod.usdjpy-history-sync` | Hourly USDJPY MT5 K-line sync into `runtime/backtest/usdjpy.sqlite` |
 | `com.quantgod.automation-chain` | Five-minute advisory-only automation chain with required-step result validation |
@@ -218,6 +233,9 @@ QG_MT5_TERMINAL_PATH=<local MetaTrader 5 terminal64.exe>
 QG_MT5_PYTHON_BIN=<python3 with optional MetaTrader5 package>
 QG_MT5_EXPECTED_SERVER=HFMarketsGlobal-Live12
 QG_MT5_LOGIN_REFERENCE_CONFIG=<private same-prefix QuantGod_MT5_LoginOnly_mac.ini>
+QG_MT5_SECONDARY_ENABLED=0
+QG_MT5_SECONDARY_SHADOW_ENABLED=<0 for local-shadow; 1 for local-dual-shadow>
+QG_MT5_SECONDARY_ALLOW_LIVE_TRADING=0
 QG_USDJPY_HISTORY_SYNC_ENABLED=1
 QG_USDJPY_HISTORY_INTERVAL_SECONDS=3600
 QG_TELEGRAM_PUSH_ALLOWED=0

@@ -85,6 +85,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
         extra_env: dict[str, str] | None = None,
         pgrep_body: str = "#!/bin/bash\nexit 1\n",
     ) -> dict[str, pathlib.Path]:
+        root = root.resolve()
         private_root = root / "private"
         bin_dir = private_root / "bin"
         log_dir = private_root / "logs"
@@ -94,16 +95,36 @@ class MacLaunchdHelperTests(unittest.TestCase):
         env_path = private_root / "launchd.env"
         prefix = root / "mt5-prefix"
         mt5_root = prefix / "drive_c" / "Program Files" / "MetaTrader 5"
+        peer_prefix = root / "mt5-peer-prefix"
+        peer_root = peer_prefix / "drive_c" / "Program Files" / "MetaTrader 5"
         config_root = prefix / "drive_c" / "qg"
         shadow_config = config_root / "QuantGod_MT5_HFM_Shadow_mac.ini"
         login_reference = config_root / "QuantGod_MT5_LoginOnly_mac.ini"
         preset = mt5_root / "MQL5" / "Presets" / "QuantGod_MT5_HFM_Shadow.set"
         terminal = mt5_root / "terminal64.exe"
+        peer_terminal = peer_root / "terminal64.exe"
+        ea_source = mt5_root / "MQL5" / "Experts" / "QuantGod_MultiStrategy.mq5"
+        ea_binary = mt5_root / "MQL5" / "Experts" / "QuantGod_MultiStrategy.ex5"
+        verified_source = config_root / "QuantGod_MultiStrategy.mq5"
+        verified_binary = config_root / "QuantGod_MultiStrategy.ex5"
+        verified_compile_log = config_root / "compile.log"
         fake_bin = root / "fake-bin"
         fake_pgrep = fake_bin / "pgrep"
         fake_wine = root / "fake-wine"
         backend = root / "backend"
-        for directory in (bin_dir, log_dir, lock_dir, status_dir, backup_dir, config_root, preset.parent, backend, fake_bin):
+        for directory in (
+            bin_dir,
+            log_dir,
+            lock_dir,
+            status_dir,
+            backup_dir,
+            config_root,
+            preset.parent,
+            peer_root,
+            ea_source.parent,
+            backend,
+            fake_bin,
+        ):
             directory.mkdir(parents=True, exist_ok=True)
         shadow_config.write_text(
             f"[Common]\nLogin=123456789\nServer={launchd.MT5_EXPECTED_BROKER_SERVER}\n"
@@ -115,11 +136,24 @@ class MacLaunchdHelperTests(unittest.TestCase):
             f"[Common]\nLogin=123456789\nServer={launchd.MT5_EXPECTED_BROKER_SERVER}\n",
             encoding="utf-8",
         )
+        shadow_config.chmod(0o600)
+        login_reference.chmod(0o600)
         preset.write_text(
             "ShadowMode=true\nReadOnlyMode=true\nEnablePilotAutoTrading=false\n",
             encoding="utf-8",
         )
         terminal.write_bytes(b"test terminal")
+        peer_terminal.write_bytes(b"test terminal")
+        ea_source.write_text("#property strict\nvoid OnTick() {}\n", encoding="utf-8")
+        ea_binary.write_bytes(b"verified shadow ea")
+        verified_source.write_bytes(ea_source.read_bytes())
+        verified_binary.write_bytes(ea_binary.read_bytes())
+        verified_compile_log.write_text(
+            "C:\\qg\\QuantGod_MultiStrategy.mq5 : information: compiling "
+            "C:\\qg\\QuantGod_MultiStrategy.mq5\n"
+            "Result: 0 errors, 0 warnings, 1 ms elapsed\n",
+            encoding="utf-8",
+        )
         fake_wine.write_text(wine_body, encoding="utf-8")
         fake_wine.chmod(0o700)
         fake_pgrep.write_text(pgrep_body, encoding="utf-8")
@@ -138,6 +172,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
             "QG_MT5_START_MODE": "shadow",
             "QG_MT5_LIVE_LAUNCH_ALLOWED": "0",
             "QG_MT5_SECONDARY_ENABLED": "0",
+            "QG_MT5_SECONDARY_SHADOW_ENABLED": "1",
             "QG_MT5_SECONDARY_ALLOW_LIVE_TRADING": "0",
             "QG_ORDER_SEND_ALLOWED": "0",
             "QG_BROKER_EXECUTION_ALLOWED": "0",
@@ -157,6 +192,12 @@ class MacLaunchdHelperTests(unittest.TestCase):
             "QG_MT5_SHADOW_PRESET": str(preset),
             "QG_MT5_SHADOW_CONFIG_WINDOWS": r"C:\qg\QuantGod_MT5_HFM_Shadow_mac.ini",
             "QG_MT5_EXPECTED_SERVER": launchd.MT5_EXPECTED_BROKER_SERVER,
+            "QG_MT5_PEER_ROOT": str(peer_root),
+            "QG_MT5_PEER_TERMINAL_PATH": str(peer_terminal),
+            "QG_MT5_PEER_SHADOW_CONFIG_WINDOWS": r"C:\qg\QuantGod_MT5_HFM_SecondaryShadow_mac.ini",
+            "QG_MT5_VERIFIED_EA_SOURCE": str(verified_source),
+            "QG_MT5_VERIFIED_EA_BINARY": str(verified_binary),
+            "QG_MT5_VERIFIED_EA_COMPILE_LOG": str(verified_compile_log),
             **launchd.local_user_environment(),
             **(extra_env or {}),
         }
@@ -174,6 +215,13 @@ class MacLaunchdHelperTests(unittest.TestCase):
             mock.patch.object(launchd, "ENV_PATH", env_path),
         ):
             wrapper_text = launchd.render_wrappers()["quantgod-mt5-shadow-supervisor.sh"]
+        wrapper_text = wrapper_text.replace(
+            '/usr/sbin/lsof -a -p "$pid" -d cwd -Fn 2>/dev/null',
+            'printf \'fcwd\\nn%s\\n\' "$QG_MT5_ROOT"',
+        ).replace(
+            '/bin/ps -p "$pid" -o command= 2>/dev/null',
+            'printf \'wine64 terminal64.exe /portable /config:%s\\n\' "$QG_MT5_SHADOW_CONFIG_WINDOWS"',
+        )
         wrapper = bin_dir / "quantgod-mt5-shadow-supervisor.sh"
         wrapper.write_text(wrapper_text, encoding="utf-8")
         wrapper.chmod(0o700)
@@ -181,6 +229,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
             "wrapper": wrapper,
             "status": status_dir / "mt5-shadow-supervisor.json",
             "lock": lock_dir / "mt5-shadow-supervisor.lock",
+            "verified_compile_log": verified_compile_log,
         }
 
     def test_rendered_env_uses_split_repo_paths_and_safe_defaults(self) -> None:
@@ -223,6 +272,9 @@ class MacLaunchdHelperTests(unittest.TestCase):
             self.assertIn("QG_MT5_START_MODE='shadow'", text)
             self.assertIn("QG_MT5_LIVE_LAUNCH_ALLOWED='0'", text)
             self.assertIn("QG_MT5_SECONDARY_ENABLED='0'", text)
+            self.assertIn("QG_MT5_SECONDARY_SHADOW_ENABLED='0'", text)
+            self.assertIn("QG_MT5_SECONDARY_ALLOW_LIVE_TRADING='0'", text)
+            self.assertIn("QuantGod_MT5_HFM_SecondaryShadow_mac.ini", text)
             self.assertIn(
                 f"QG_MT5_EXPECTED_SERVER='{launchd.MT5_EXPECTED_BROKER_SERVER}'",
                 text,
@@ -327,6 +379,33 @@ class MacLaunchdHelperTests(unittest.TestCase):
         self.assertNotIn("frontend-dev", selected)
         self.assertNotIn("daily-autopilot", selected)
         self.assertNotIn("ai-telegram-monitor", selected)
+
+        dual_selected = launchd.SERVICE_PROFILES["local-dual-shadow"]
+        self.assertEqual(
+            dual_selected,
+            (
+                "frontend-dist-build",
+                "backend-api",
+                "mt5-shadow-supervisor",
+                "mt5-secondary-shadow-supervisor",
+                "usdjpy-history-sync",
+                "automation-chain",
+                "health-maintenance",
+                "log-maintenance",
+                "sqlite-backup",
+            ),
+        )
+        dual_env = launchd.render_env(
+            {
+                "backend": pathlib.Path("b"),
+                "frontend": pathlib.Path("f"),
+                "infra": pathlib.Path("i"),
+                "docs": pathlib.Path("d"),
+            },
+            secondary_shadow_enabled=True,
+        )
+        self.assertIn("QG_MT5_SECONDARY_SHADOW_ENABLED='1'", dual_env)
+        self.assertIn("QG_MT5_SECONDARY_ENABLED='0'", dual_env)
 
     def test_install_rolls_back_services_loaded_before_bootstrap_failure(self) -> None:
         args = launchd.build_parser().parse_args(["install", "--profile", "core"])
@@ -618,8 +697,11 @@ class MacLaunchdHelperTests(unittest.TestCase):
         self.assertIn("MT5_SHADOW_STOPPING", mt5)
         self.assertIn("MT5_CHILD_DETACHED", mt5)
         self.assertIn(launchd.MT5_TERMINAL_PROCESS_PATTERN, mt5)
-        self.assertIn('existing_mt5="$(find_mt5_terminal_pids)"', mt5)
-        self.assertIn('detached_mt5="$(find_mt5_terminal_pids)"', mt5)
+        self.assertIn('existing_mt5="$(find_mt5_terminal_pids_for_root)"', mt5)
+        self.assertIn('detached_mt5="$(find_mt5_terminal_pids_for_root)"', mt5)
+        self.assertIn("MT5_SHADOW_EA_PROVENANCE_INVALID", mt5)
+        self.assertIn("MT5_TERMINAL_BINARY_MISMATCH", mt5)
+        self.assertIn("UNREVIEWED_MT5_PROCESS", mt5)
         self.assertNotIn("pgrep -f '[t]erminal64\\.exe'", mt5)
         self.assertNotIn('exec "$QG_MT5_WINE_BIN"', mt5)
         self.assertNotIn("pkill", mt5)
@@ -628,6 +710,12 @@ class MacLaunchdHelperTests(unittest.TestCase):
             mt5.index('"$QG_MT5_WINE_BIN" terminal64.exe'),
         )
         self.assertNotIn("LivePilot", mt5)
+
+        secondary_mt5 = wrappers["quantgod-mt5-secondary-shadow-supervisor.sh"]
+        self.assertIn("QuantGod_MT5_HFM_SecondaryShadow_mac.ini", secondary_mt5)
+        self.assertIn(launchd.MT5_SECONDARY_EXPECTED_BROKER_SERVER, secondary_mt5)
+        self.assertNotIn(launchd.MT5_EXPECTED_BROKER_SERVER, secondary_mt5)
+        self.assertIn('QG_SERVICE_NAME="mt5-secondary-shadow-supervisor"', secondary_mt5)
 
         automation = wrappers["quantgod-automation-chain.sh"]
         self.assertIn("did not return a non-empty step list", automation)
@@ -881,6 +969,30 @@ class MacLaunchdHelperTests(unittest.TestCase):
             status = json.loads(fixture["status"].read_text(encoding="utf-8"))
             self.assertEqual(status["taskStatus"], "BLOCKED")
             self.assertEqual(status["code"], "EXISTING_MT5_PROCESS")
+
+    def test_mt5_supervisor_rejects_stale_trade_capable_compile_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._create_mt5_wrapper_fixture(
+                pathlib.Path(tmp),
+                "#!/bin/bash\nexit 0\n",
+            )
+            fixture["verified_compile_log"].write_text(
+                "C:\\qg\\QuantGod_MultiStrategy.mq5 : information: compiling "
+                "C:\\qg\\QuantGod_MultiStrategy.mq5\n"
+                "unsafe_surface=Trade/Trade.mqh\n"
+                "Result: 0 errors, 0 warnings, 1 ms elapsed\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["/bin/bash", str(fixture["wrapper"])],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 78)
+            status = json.loads(fixture["status"].read_text(encoding="utf-8"))
+            self.assertEqual(status["taskStatus"], "BLOCKED")
+            self.assertEqual(status["code"], "MT5_SHADOW_EA_PROVENANCE_INVALID")
 
     def test_real_wine_terminal_match_detects_detached_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
