@@ -96,11 +96,13 @@ before any managed-file or launchd state change if a selected capability is
 stopped; atomic `/vue` publication then completes while it is stopped and before
 restart. Managed files are published with `fsync` plus atomic replace; if final
 capability or service activation fails, the previous `/vue`, managed files,
-secondary observer preset, and previously loaded QuantGod profile are restored.
+secondary observer preset/EA artifacts, and previously loaded QuantGod profile
+are restored.
 For `local-dual-shadow`, a safe Backend preset source can appear as
-`READY_AFTER_PRESET_DEPLOY` in `--no-load`; preflight remains read-only and the
-copy occurs only after both MT5 supervisors have been stopped during a real
-transactional install.
+`READY_AFTER_PRESET_DEPLOY`, while verified EA drift can appear as
+`READY_AFTER_EA_DEPLOY` (or the combined `READY_AFTER_SECONDARY_DEPLOY`) in
+`--no-load`; preflight remains read-only and the copies occur only after both MT5
+supervisors have been stopped during a real transactional install.
 
 `local-shadow` uses the compiled Frontend served by Backend `/vue`; it does not
 load the Vite development server, Daily Autopilot, Telegram, or DeepSeek. It
@@ -152,12 +154,22 @@ guards require an exact source match plus `Watchlist=USDJPY`,
 `PreferredSymbolSuffix=AUTO`, `ShadowMode=true`, `ReadOnlyMode=true`,
 `EnablePilotAutoTrading=false`, and every reviewed live-route authorization to
 remain false; `USDJPYc`, suffix `c`, preset drift, or any trading enablement
-blocks Wine before launch. Installed EA source and binary must match the same
-clean verified build staging artifacts;
+blocks Wine before launch. During the same stopped transaction, the secondary
+`MQL5/Experts/QuantGod_MultiStrategy.mq5` and `.ex5` are atomically refreshed
+only from the primary prefix's verified private `drive_c/qg` staging pair. Both
+files are snapshotted and restored on any failure. Installed EA source and binary
+must then match the same clean verified build staging artifacts;
 the source is scanned for Trade.mqh, CTrade, OrderSend, and raw trade actions
 before either terminal starts. The private `drive_c/qg/compile.log` must identify
-the reviewed staging source, report zero errors and warnings, contain no broker
-mutation surface, and belong to the same build-time window as the staged binary.
+exactly one unique compile source named
+`C:\qg\compile-run.<mktemp-token>\QuantGod_MultiStrategy.mq5`, where the token
+is exactly six ASCII alphanumeric characters generated from the macOS
+`mktemp .../compile-run.XXXXXX` directory. Both sides of MetaEditor’s
+`information: compiling` record must use the same token. Legacy fixed paths,
+timestamp/PID-shaped paths, invalid tokens, and duplicate compiling records are
+rejected. The log must also report zero errors and warnings, contain no broker
+mutation surface, and belong to the same build-time window as the canonical
+staged binary.
 The legacy `QG_MT5_SECONDARY_ENABLED` execution
 switch stays `0`; only the read-only `QG_MT5_SECONDARY_SHADOW_ENABLED` observer
 flag becomes `1` in this profile.

@@ -23,6 +23,9 @@ spec.loader.exec_module(launchd)
 
 
 class MacLaunchdHelperTests(unittest.TestCase):
+    VERIFIED_COMPILE_RUN_SOURCE = (
+        r"C:\qg\compile-run.A1b2C3\QuantGod_MultiStrategy.mq5"
+    )
     AUTOMATION_REQUIRED_STEP_IDS = (
         "adaptive_policy",
         "dynamic_sltp",
@@ -149,8 +152,8 @@ class MacLaunchdHelperTests(unittest.TestCase):
         verified_source.write_bytes(ea_source.read_bytes())
         verified_binary.write_bytes(ea_binary.read_bytes())
         verified_compile_log.write_text(
-            "C:\\qg\\QuantGod_MultiStrategy.mq5 : information: compiling "
-            "C:\\qg\\QuantGod_MultiStrategy.mq5\n"
+            f"{self.VERIFIED_COMPILE_RUN_SOURCE} : information: compiling "
+            f"{self.VERIFIED_COMPILE_RUN_SOURCE}\n"
             "Result: 0 errors, 0 warnings, 1 ms elapsed\n",
             encoding="utf-8",
         )
@@ -585,7 +588,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
         discard.assert_not_called()
         self.assertEqual(bootstrap_calls, [backend_label, backend_label])
 
-    def test_dual_shadow_activation_failure_restores_secondary_preset(self) -> None:
+    def test_dual_shadow_activation_failure_restores_secondary_artifacts(self) -> None:
         args = launchd.build_parser().parse_args(["install", "--profile", "local-dual-shadow"])
         paths = {
             "backend": pathlib.Path("b"),
@@ -600,6 +603,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
             }
         }
         preset_snapshot = (b"old-secondary-preset", 0o600)
+        ea_snapshot = {pathlib.Path("secondary-ea"): (b"old-secondary-ea", 0o600)}
         backend_label = launchd.SERVICES["backend-api"]["label"]
 
         def fail_backend_activation(label: str) -> None:
@@ -624,8 +628,15 @@ class MacLaunchdHelperTests(unittest.TestCase):
                 "snapshot_secondary_shadow_preset",
                 return_value=preset_snapshot,
             ) as snapshot_preset,
+            mock.patch.object(
+                launchd,
+                "snapshot_secondary_shadow_ea_artifacts",
+                return_value=ea_snapshot,
+            ) as snapshot_ea,
             mock.patch.object(launchd, "deploy_secondary_shadow_preset") as deploy_preset,
+            mock.patch.object(launchd, "deploy_secondary_shadow_ea_artifacts") as deploy_ea,
             mock.patch.object(launchd, "restore_secondary_shadow_preset") as restore_preset,
+            mock.patch.object(launchd, "restore_secondary_shadow_ea_artifacts") as restore_ea,
             mock.patch.object(launchd, "restore_managed_files"),
             mock.patch.object(launchd, "write_files", return_value=paths),
             mock.patch.object(launchd, "bootout"),
@@ -635,7 +646,10 @@ class MacLaunchdHelperTests(unittest.TestCase):
                 launchd.install(args)
 
         snapshot_preset.assert_called_once_with()
+        snapshot_ea.assert_called_once_with()
         deploy_preset.assert_called_once_with(paths)
+        deploy_ea.assert_called_once_with()
+        restore_ea.assert_called_once_with(ea_snapshot)
         restore_preset.assert_called_once_with(preset_snapshot)
 
     def test_missing_compiled_frontend_is_buildable_before_final_preflight(self) -> None:
@@ -663,7 +677,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
             ["backend-api"],
         )
 
-    def test_secondary_preset_drift_is_synchronously_deployable_only_for_dual_profile(self) -> None:
+    def test_secondary_artifact_drift_is_synchronously_deployable_only_for_dual_profile(self) -> None:
         selected = launchd.SERVICE_PROFILES["local-dual-shadow"]
         capabilities = {
             name: {"service": name, "ready": True, "status": "READY", "reasonCodes": []}
@@ -675,6 +689,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
             "status": "BLOCKED",
             "reasonCodes": [
                 "MT5_SECONDARY_SHADOW_PRESET_SOURCE_MISMATCH",
+                "MT5_SECONDARY_SHADOW_EA_BINARY_MISMATCH",
                 "MT5_SHADOW_PRESET_WATCHLIST_INVALID",
                 "MT5_SHADOW_PRESET_PREFERREDSYMBOLSUFFIX_INVALID",
             ],
@@ -683,7 +698,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
             launchd.selected_capability_blockers(
                 capabilities,
                 selected,
-                allow_secondary_preset_deploy=True,
+                allow_secondary_artifact_deploy=True,
             ),
             [],
         )
@@ -700,7 +715,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
                 for row in launchd.selected_capability_blockers(
                     capabilities,
                     selected,
-                    allow_secondary_preset_deploy=True,
+                    allow_secondary_artifact_deploy=True,
                 )
             ],
             ["mt5-secondary-shadow-supervisor"],
@@ -1085,8 +1100,8 @@ class MacLaunchdHelperTests(unittest.TestCase):
                 "#!/bin/bash\nexit 0\n",
             )
             fixture["verified_compile_log"].write_text(
-                "C:\\qg\\QuantGod_MultiStrategy.mq5 : information: compiling "
-                "C:\\qg\\QuantGod_MultiStrategy.mq5\n"
+                f"{self.VERIFIED_COMPILE_RUN_SOURCE} : information: compiling "
+                f"{self.VERIFIED_COMPILE_RUN_SOURCE}\n"
                 "unsafe_surface=Trade/Trade.mqh\n"
                 "Result: 0 errors, 0 warnings, 1 ms elapsed\n",
                 encoding="utf-8",
@@ -1101,6 +1116,53 @@ class MacLaunchdHelperTests(unittest.TestCase):
             status = json.loads(fixture["status"].read_text(encoding="utf-8"))
             self.assertEqual(status["taskStatus"], "BLOCKED")
             self.assertEqual(status["code"], "MT5_SHADOW_EA_PROVENANCE_INVALID")
+
+    def test_mt5_supervisor_rejects_non_unique_compile_run_provenance(self) -> None:
+        valid = self.VERIFIED_COMPILE_RUN_SOURCE
+        cases = {
+            "legacy-fixed-source": (
+                r"C:\qg\QuantGod_MultiStrategy.mq5 : information: compiling "
+                r"C:\qg\QuantGod_MultiStrategy.mq5"
+            ),
+            "mismatched-run-id": (
+                f"{valid} : information: compiling "
+                r"C:\qg\compile-run.A1b2C4\QuantGod_MultiStrategy.mq5"
+            ),
+            "obsolete-timestamp-pid-shape": (
+                r"C:\qg\compile-run-20260803T120000.4242\QuantGod_MultiStrategy.mq5 "
+                r": information: compiling "
+                r"C:\qg\compile-run-20260803T120000.4242\QuantGod_MultiStrategy.mq5"
+            ),
+            "invalid-mktemp-token": (
+                r"C:\qg\compile-run.A1_b2C\QuantGod_MultiStrategy.mq5 "
+                r": information: compiling "
+                r"C:\qg\compile-run.A1_b2C\QuantGod_MultiStrategy.mq5"
+            ),
+            "duplicate-compile-source": (
+                f"{valid} : information: compiling {valid}\n"
+                f"{valid} : information: compiling {valid}"
+            ),
+        }
+        for name, provenance in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                fixture = self._create_mt5_wrapper_fixture(
+                    pathlib.Path(tmp),
+                    "#!/bin/bash\nexit 0\n",
+                )
+                fixture["verified_compile_log"].write_text(
+                    provenance + "\nResult: 0 errors, 0 warnings, 1 ms elapsed\n",
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    ["/bin/bash", str(fixture["wrapper"])],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 78, msg=result.stderr)
+                status = json.loads(fixture["status"].read_text(encoding="utf-8"))
+                self.assertEqual(status["taskStatus"], "BLOCKED")
+                self.assertEqual(status["code"], "MT5_SHADOW_EA_PROVENANCE_INVALID")
 
     def test_real_wine_terminal_match_detects_detached_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1324,6 +1386,49 @@ class MacLaunchdHelperTests(unittest.TestCase):
 
             self.assertEqual(target.read_text(encoding="utf-8"), old_text)
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+
+    def test_secondary_shadow_ea_deploy_is_staging_exact_atomic_and_reversible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp).resolve()
+            staging_dir = root / "primary-qg"
+            target_dir = root / "live16/MQL5/Experts"
+            staging_dir.mkdir(parents=True)
+            target_dir.mkdir(parents=True)
+            staging_source = staging_dir / "QuantGod_MultiStrategy.mq5"
+            staging_binary = staging_dir / "QuantGod_MultiStrategy.ex5"
+            target_source = target_dir / staging_source.name
+            target_binary = target_dir / staging_binary.name
+            staging_source.write_bytes(b"verified source without trade mutation")
+            staging_binary.write_bytes(b"verified compiled binary")
+            target_source.write_bytes(b"old source")
+            target_binary.write_bytes(b"old binary")
+            target_source.chmod(0o640)
+            target_binary.chmod(0o644)
+            artifact_pairs = (
+                ("SOURCE", staging_source, target_source),
+                ("BINARY", staging_binary, target_binary),
+            )
+
+            with mock.patch.object(
+                launchd,
+                "secondary_shadow_ea_artifact_pairs",
+                return_value=artifact_pairs,
+            ):
+                snapshot = launchd.snapshot_secondary_shadow_ea_artifacts()
+                self.assertEqual(
+                    launchd.deploy_secondary_shadow_ea_artifacts(),
+                    (target_source, target_binary),
+                )
+                self.assertEqual(target_source.read_bytes(), staging_source.read_bytes())
+                self.assertEqual(target_binary.read_bytes(), staging_binary.read_bytes())
+                self.assertEqual(stat.S_IMODE(target_source.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(target_binary.stat().st_mode), 0o600)
+                launchd.restore_secondary_shadow_ea_artifacts(snapshot)
+
+            self.assertEqual(target_source.read_bytes(), b"old source")
+            self.assertEqual(target_binary.read_bytes(), b"old binary")
+            self.assertEqual(stat.S_IMODE(target_source.stat().st_mode), 0o640)
+            self.assertEqual(stat.S_IMODE(target_binary.stat().st_mode), 0o644)
 
     def test_shadow_preset_guard_requires_one_exact_hfm_broker_server(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

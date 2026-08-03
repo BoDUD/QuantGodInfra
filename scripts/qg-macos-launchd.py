@@ -73,6 +73,17 @@ MT5_SECONDARY_PRESET_DEPLOYABLE_REASONS = frozenset(
         "MT5_SHADOW_PRESET_ENABLELIVETRADING_FORBIDDEN",
     }
 )
+MT5_SECONDARY_EA_DEPLOYABLE_REASONS = frozenset(
+    {
+        "MT5_SECONDARY_SHADOW_EA_SOURCE_MISSING",
+        "MT5_SECONDARY_SHADOW_EA_BINARY_MISSING",
+        "MT5_SECONDARY_SHADOW_EA_SOURCE_MISMATCH",
+        "MT5_SECONDARY_SHADOW_EA_BINARY_MISMATCH",
+    }
+)
+MT5_SECONDARY_DEPLOYABLE_REASONS = (
+    MT5_SECONDARY_PRESET_DEPLOYABLE_REASONS | MT5_SECONDARY_EA_DEPLOYABLE_REASONS
+)
 MT5_TERMINAL_PROCESS_PATTERN = (
     r"[/](wine64-preloader|wine-preloader|wine64|wine)[[:space:]]+"
     r"[t]erminal64\.exe([[:space:]]|$)"
@@ -417,6 +428,14 @@ def default_mt5_secondary_terminal_path() -> Path:
     return default_mt5_secondary_root() / "terminal64.exe"
 
 
+def default_mt5_secondary_ea_source() -> Path:
+    return default_mt5_secondary_root() / "MQL5/Experts/QuantGod_MultiStrategy.mq5"
+
+
+def default_mt5_secondary_ea_binary() -> Path:
+    return default_mt5_secondary_root() / "MQL5/Experts/QuantGod_MultiStrategy.ex5"
+
+
 def default_mt5_secondary_shadow_config() -> Path:
     return default_mt5_secondary_prefix() / "drive_c/qg/QuantGod_MT5_HFM_SecondaryShadow_mac.ini"
 
@@ -509,6 +528,42 @@ def secondary_shadow_preset_directory_issues(target: Path) -> list[str]:
     if target.parent.is_symlink() or target.parent.resolve() != target.parent.absolute():
         return ["MT5_SECONDARY_PRESET_DIRECTORY_SYMLINKED"]
     return []
+
+
+def secondary_shadow_ea_artifact_pairs() -> tuple[tuple[str, Path, Path], ...]:
+    return (
+        ("SOURCE", default_mt5_verified_ea_source(), default_mt5_secondary_ea_source()),
+        ("BINARY", default_mt5_verified_ea_binary(), default_mt5_secondary_ea_binary()),
+    )
+
+
+def secondary_shadow_ea_staging_path_issues() -> list[str]:
+    issues: list[str] = []
+    for artifact, staging, _target in secondary_shadow_ea_artifact_pairs():
+        if not staging.is_absolute() or not staging.parent.is_dir():
+            issues.append(f"MT5_VERIFIED_EA_{artifact}_PATH_INVALID")
+        elif staging.is_symlink() or staging.parent.resolve() != staging.parent.absolute():
+            issues.append(f"MT5_VERIFIED_EA_{artifact}_SYMLINKED")
+    return sorted(set(issues))
+
+
+def secondary_shadow_ea_target_path_issues() -> list[str]:
+    issues: list[str] = []
+    for artifact, _staging, target in secondary_shadow_ea_artifact_pairs():
+        if not target.is_absolute() or not target.parent.is_dir():
+            issues.append("MT5_SECONDARY_SHADOW_EA_DIRECTORY_INVALID")
+        elif target.parent.is_symlink() or target.parent.resolve() != target.parent.absolute():
+            issues.append("MT5_SECONDARY_SHADOW_EA_DIRECTORY_SYMLINKED")
+        if target.is_symlink():
+            issues.append(f"MT5_SECONDARY_SHADOW_EA_{artifact}_SYMLINKED")
+    return sorted(set(issues))
+
+
+def secondary_shadow_ea_path_issues() -> list[str]:
+    return sorted(
+        set(secondary_shadow_ea_staging_path_issues())
+        | set(secondary_shadow_ea_target_path_issues())
+    )
 
 
 def shadow_preset_guard_issues(
@@ -665,17 +720,26 @@ def service_capability(
         secondary_target = default_mt5_secondary_shadow_preset()
         require(default_mt5_wine_bin(), "MT5_WINE_MISSING", executable=True)
         require(default_mt5_secondary_terminal_path(), "MT5_SECONDARY_TERMINAL_MISSING")
-        require(
-            default_mt5_secondary_root() / "MQL5/Experts/QuantGod_MultiStrategy.mq5",
-            "MT5_SECONDARY_SHADOW_EA_SOURCE_MISSING",
-        )
-        require(
-            default_mt5_secondary_root() / "MQL5/Experts/QuantGod_MultiStrategy.ex5",
-            "MT5_SECONDARY_SHADOW_EA_BINARY_MISSING",
-        )
+        require(default_mt5_secondary_ea_source(), "MT5_SECONDARY_SHADOW_EA_SOURCE_MISSING")
+        require(default_mt5_secondary_ea_binary(), "MT5_SECONDARY_SHADOW_EA_BINARY_MISSING")
         require(default_mt5_verified_ea_source(), "MT5_VERIFIED_EA_SOURCE_MISSING")
         require(default_mt5_verified_ea_binary(), "MT5_VERIFIED_EA_BINARY_MISSING")
         require(default_mt5_verified_ea_compile_log(), "MT5_VERIFIED_EA_COMPILE_LOG_MISSING")
+        ea_path_issues = secondary_shadow_ea_path_issues()
+        issues.extend(ea_path_issues)
+        if not ea_path_issues:
+            for artifact, staging, target in secondary_shadow_ea_artifact_pairs():
+                if not staging.is_file() or not target.is_file():
+                    continue
+                try:
+                    matches_staging = hmac.compare_digest(
+                        staging.read_bytes(), target.read_bytes()
+                    )
+                except OSError:
+                    issues.append(f"MT5_SECONDARY_SHADOW_EA_{artifact}_UNREADABLE")
+                else:
+                    if not matches_staging:
+                        issues.append(f"MT5_SECONDARY_SHADOW_EA_{artifact}_MISMATCH")
         source_issues = secondary_shadow_preset_source_issues(secondary_source)
         issues.extend(source_issues)
         issues.extend(secondary_shadow_preset_directory_issues(secondary_target))
@@ -1569,12 +1633,22 @@ log_text = raw_log.decode(encoding, errors="strict")
 if re.search(r"^\s*Result:\s*0 errors,\s*0 warnings(?:,|$)", log_text, flags=re.MULTILINE) is None:
     raise SystemExit("the verified EA compile log is not clean")
 normalized_log = log_text.replace("/", "\\")
-if re.search(
-    r"^C:\\qg\\QuantGod_MultiStrategy\.mq5\s+:\s+information:\s+compiling\s+"
-    r"C:\\qg\\QuantGod_MultiStrategy\.mq5\s*$",
-    normalized_log,
-    flags=re.MULTILINE,
-) is None:
+compile_lines = [
+    line.strip()
+    for line in normalized_log.splitlines()
+    if re.search(r":\s+information:\s+compiling\s+", line)
+]
+if len(compile_lines) != 1:
+    raise SystemExit("the verified EA compile log must identify exactly one compile source")
+compile_match = re.fullmatch(
+    r"C:\\qg\\compile-run\."
+    r"(?P<token>[A-Za-z0-9]{6})"
+    r"\\QuantGod_MultiStrategy\.mq5\s+:\s+information:\s+compiling\s+"
+    r"C:\\qg\\compile-run\.(?P=token)"
+    r"\\QuantGod_MultiStrategy\.mq5",
+    compile_lines[0],
+)
+if compile_match is None:
     raise SystemExit("the verified EA compile log does not identify the reviewed staging source")
 for pattern in (
     r"Trade[/\\]Trade\.mqh",
@@ -2474,12 +2548,71 @@ def deploy_secondary_shadow_preset(paths: dict[str, Path]) -> Path:
     return target
 
 
+def snapshot_secondary_shadow_ea_artifacts() -> dict[Path, tuple[bytes, int] | None]:
+    issues = secondary_shadow_ea_target_path_issues()
+    if issues:
+        raise RuntimeError("secondary Shadow EA targets are unsafe: " + ",".join(issues))
+    snapshot: dict[Path, tuple[bytes, int] | None] = {}
+    for _artifact, _staging, target in secondary_shadow_ea_artifact_pairs():
+        if target.exists() and not target.is_file():
+            raise RuntimeError(f"refusing non-file secondary Shadow EA target: {target}")
+        snapshot[target] = (
+            (target.read_bytes(), stat.S_IMODE(target.stat().st_mode))
+            if target.is_file()
+            else None
+        )
+    return snapshot
+
+
+def restore_secondary_shadow_ea_artifacts(
+    snapshot: dict[Path, tuple[bytes, int] | None],
+) -> None:
+    issues = secondary_shadow_ea_target_path_issues()
+    if issues:
+        raise RuntimeError("secondary Shadow EA targets are unsafe: " + ",".join(issues))
+    expected_targets = {
+        target for _artifact, _staging, target in secondary_shadow_ea_artifact_pairs()
+    }
+    if set(snapshot) != expected_targets:
+        raise RuntimeError("secondary Shadow EA rollback snapshot has unexpected targets")
+    for target in expected_targets:
+        previous = snapshot[target]
+        if previous is None:
+            if target.exists():
+                if not target.is_file():
+                    raise RuntimeError(f"refusing to remove non-file secondary Shadow EA: {target}")
+                target.unlink()
+            continue
+        content, mode = previous
+        atomic_write_bytes(target, content, mode)
+
+
+def deploy_secondary_shadow_ea_artifacts() -> tuple[Path, ...]:
+    issues = secondary_shadow_ea_path_issues()
+    if issues:
+        raise RuntimeError("secondary Shadow EA deployment paths are unsafe: " + ",".join(issues))
+    deployed: list[Path] = []
+    for artifact, staging, target in secondary_shadow_ea_artifact_pairs():
+        if not staging.is_file():
+            raise RuntimeError(f"verified EA {artifact.lower()} staging artifact is missing")
+        if target.exists() and not target.is_file():
+            raise RuntimeError(f"refusing non-file secondary Shadow EA target: {target}")
+        content = staging.read_bytes()
+        atomic_write_bytes(target, content, PRIVATE_FILE_MODE)
+        if not hmac.compare_digest(content, target.read_bytes()):
+            raise RuntimeError(
+                f"secondary Shadow EA {artifact.lower()} publication verification failed"
+            )
+        deployed.append(target)
+    return tuple(deployed)
+
+
 def selected_capability_blockers(
     capabilities: dict[str, dict[str, Any]],
     selected_names: tuple[str, ...],
     *,
     allow_frontend_build_output: bool = False,
-    allow_secondary_preset_deploy: bool = False,
+    allow_secondary_artifact_deploy: bool = False,
 ) -> list[dict[str, Any]]:
     blocked: list[dict[str, Any]] = []
     frontend_builder_ready = (
@@ -2499,10 +2632,10 @@ def selected_capability_blockers(
         ):
             continue
         if (
-            allow_secondary_preset_deploy
+            allow_secondary_artifact_deploy
             and name == "mt5-secondary-shadow-supervisor"
             and reasons
-            and reasons <= MT5_SECONDARY_PRESET_DEPLOYABLE_REASONS
+            and reasons <= MT5_SECONDARY_DEPLOYABLE_REASONS
         ):
             continue
         blocked.append(row)
@@ -2567,7 +2700,7 @@ def install(args: argparse.Namespace) -> int:
     selected_names = SERVICE_PROFILES[args.profile]
     runtime_selected_names = tuple(name for name in selected_names if name != "frontend-dist-build")
     selected_labels = [SERVICES[name]["label"] for name in runtime_selected_names]
-    secondary_preset_deploy_selected = (
+    secondary_artifact_deploy_selected = (
         "mt5-secondary-shadow-supervisor" in runtime_selected_names
     )
     capabilities = build_capability_report(paths, workspace=args.workspace)["services"]
@@ -2580,27 +2713,37 @@ def install(args: argparse.Namespace) -> int:
             capabilities,
             selected_names,
             allow_frontend_build_output=True,
-            allow_secondary_preset_deploy=secondary_preset_deploy_selected,
+            allow_secondary_artifact_deploy=secondary_artifact_deploy_selected,
         )
         preview_blocked_names = {row["service"] for row in preview_blocked}
         frontend_builder_ready = capabilities.get("frontend-dist-build", {}).get("ready") is True
         for row in (capabilities[name] for name in selected_names):
             reasons = ",".join(row["reasonCodes"]) or "reviewed dependencies available"
             status = row["status"]
+            row_reasons = set(row["reasonCodes"])
             if (
                 row["service"] == "backend-api"
                 and frontend_builder_ready
-                and set(row["reasonCodes"]) == {"COMPILED_FRONTEND_MISSING"}
+                and row_reasons == {"COMPILED_FRONTEND_MISSING"}
             ):
                 status = "READY_AFTER_BUILD"
                 reasons = "compiled Frontend will be produced before service switch"
             elif (
                 row["service"] == "mt5-secondary-shadow-supervisor"
-                and set(row["reasonCodes"])
-                and set(row["reasonCodes"]) <= MT5_SECONDARY_PRESET_DEPLOYABLE_REASONS
+                and row_reasons
+                and row_reasons <= MT5_SECONDARY_DEPLOYABLE_REASONS
             ):
-                status = "READY_AFTER_PRESET_DEPLOY"
-                reasons = "reviewed Backend USDJPY/AUTO preset will be atomically deployed"
+                needs_preset = bool(row_reasons & MT5_SECONDARY_PRESET_DEPLOYABLE_REASONS)
+                needs_ea = bool(row_reasons & MT5_SECONDARY_EA_DEPLOYABLE_REASONS)
+                if needs_preset and needs_ea:
+                    status = "READY_AFTER_SECONDARY_DEPLOY"
+                    reasons = "reviewed preset and verified staging EA will be atomically deployed"
+                elif needs_ea:
+                    status = "READY_AFTER_EA_DEPLOY"
+                    reasons = "verified staging EA source/binary will be atomically deployed"
+                else:
+                    status = "READY_AFTER_PRESET_DEPLOY"
+                    reasons = "reviewed Backend USDJPY/AUTO preset will be atomically deployed"
             print(f"  {row['service']}: {status} - {reasons}")
         print("--no-load performed capability inspection only; it wrote no env, wrapper, plist, or status file.")
         if preview_blocked_names:
@@ -2613,7 +2756,7 @@ def install(args: argparse.Namespace) -> int:
         capabilities,
         selected_names,
         allow_frontend_build_output=True,
-        allow_secondary_preset_deploy=secondary_preset_deploy_selected,
+        allow_secondary_artifact_deploy=secondary_artifact_deploy_selected,
     )
     if blocked:
         details = "; ".join(
@@ -2633,7 +2776,7 @@ def install(args: argparse.Namespace) -> int:
             capabilities,
             selected_names,
             allow_frontend_build_output=True,
-            allow_secondary_preset_deploy=secondary_preset_deploy_selected,
+            allow_secondary_artifact_deploy=secondary_artifact_deploy_selected,
         )
         if blocked:
             details = "; ".join(
@@ -2649,8 +2792,13 @@ def install(args: argparse.Namespace) -> int:
     previous_files = snapshot_managed_files()
     secondary_preset_snapshot = (
         snapshot_secondary_shadow_preset()
-        if secondary_preset_deploy_selected
+        if secondary_artifact_deploy_selected
         else None
+    )
+    secondary_ea_snapshot = (
+        snapshot_secondary_shadow_ea_artifacts()
+        if secondary_artifact_deploy_selected
+        else {}
     )
     loaded_labels: list[str] = []
     frontend_snapshot: tuple[Path, Path | None] | None = None
@@ -2660,9 +2808,10 @@ def install(args: argparse.Namespace) -> int:
         if frontend_build_selected:
             frontend_snapshot = stage_frontend_dist_rollback(paths)
             publish_frontend_dist(paths, args.workspace)
-        if secondary_preset_deploy_selected:
+        if secondary_artifact_deploy_selected:
             deploy_secondary_shadow_preset(paths)
-        if frontend_build_selected or secondary_preset_deploy_selected:
+            deploy_secondary_shadow_ea_artifacts()
+        if frontend_build_selected or secondary_artifact_deploy_selected:
             capabilities = build_capability_report(paths, workspace=args.workspace)["services"]
             blocked = selected_capability_blockers(capabilities, selected_names)
             if blocked:
@@ -2700,7 +2849,11 @@ def install(args: argparse.Namespace) -> int:
                 restore_frontend_dist(frontend_snapshot)
             except Exception as exc:
                 rollback_errors.append(f"Frontend dist restore failed: {exc}")
-        if secondary_preset_deploy_selected:
+        if secondary_artifact_deploy_selected:
+            try:
+                restore_secondary_shadow_ea_artifacts(secondary_ea_snapshot)
+            except Exception as exc:
+                rollback_errors.append(f"secondary Shadow EA restore failed: {exc}")
             try:
                 restore_secondary_shadow_preset(secondary_preset_snapshot)
             except Exception as exc:
