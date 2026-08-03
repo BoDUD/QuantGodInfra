@@ -2,7 +2,8 @@
 """Install QuantGod macOS launchd background automation.
 
 The launchd layer keeps local services and evidence loops running.  It is not a
-trading permission layer: it does not write live presets, send orders, close
+trading permission layer: it can publish the reviewed read-only secondary
+observer preset, but it does not write live-enabled presets, send orders, close
 positions, or bypass QuantGod safety gates.
 """
 from __future__ import annotations
@@ -39,6 +40,39 @@ USER_DOMAIN = f"gui/{os.getuid()}"
 LABEL_PREFIX = "com.quantgod"
 MT5_EXPECTED_BROKER_SERVER = "HFMarketsGlobal-Live12"
 MT5_SECONDARY_EXPECTED_BROKER_SERVER = "HFMarketsGlobal-Live16"
+MT5_SECONDARY_PRESET_SOURCE_RELATIVE = Path(
+    "MQL5/Presets/QuantGod_MT5_HFM_LiveSecondary.set"
+)
+MT5_SECONDARY_REQUIRED_PRESET_VALUES = {
+    "Watchlist": "USDJPY",
+    "PreferredSymbolSuffix": "AUTO",
+    "ShadowMode": "true",
+    "ReadOnlyMode": "true",
+    "EnablePilotAutoTrading": "false",
+    "EnablePilotRsiH1Live": "false",
+    "EnablePilotBBH1Live": "false",
+    "EnablePilotMacdH1Live": "false",
+    "EnablePilotSRM15Live": "false",
+    "EnableNonRsiLegacyLiveAuthorization": "false",
+}
+MT5_SECONDARY_PRESET_DEPLOYABLE_REASONS = frozenset(
+    {
+        "MT5_SHADOW_PRESET_MISSING",
+        "MT5_SECONDARY_SHADOW_PRESET_SOURCE_MISMATCH",
+        *(
+            f"MT5_SHADOW_PRESET_{key.upper()}_INVALID"
+            for key in MT5_SECONDARY_REQUIRED_PRESET_VALUES
+        ),
+        "MT5_SHADOW_PRESET_ORDERSENDALLOWED_DUPLICATE",
+        "MT5_SHADOW_PRESET_ORDERSENDALLOWED_FORBIDDEN",
+        "MT5_SHADOW_PRESET_BROKEREXECUTIONALLOWED_DUPLICATE",
+        "MT5_SHADOW_PRESET_BROKEREXECUTIONALLOWED_FORBIDDEN",
+        "MT5_SHADOW_PRESET_LIVEPRESETMUTATIONALLOWED_DUPLICATE",
+        "MT5_SHADOW_PRESET_LIVEPRESETMUTATIONALLOWED_FORBIDDEN",
+        "MT5_SHADOW_PRESET_ENABLELIVETRADING_DUPLICATE",
+        "MT5_SHADOW_PRESET_ENABLELIVETRADING_FORBIDDEN",
+    }
+)
 MT5_TERMINAL_PROCESS_PATTERN = (
     r"[/](wine64-preloader|wine-preloader|wine64|wine)[[:space:]]+"
     r"[t]erminal64\.exe([[:space:]]|$)"
@@ -395,6 +429,12 @@ def default_mt5_secondary_shadow_preset() -> Path:
     return default_mt5_secondary_root() / "MQL5/Presets/QuantGod_MT5_HFM_Shadow.set"
 
 
+def backend_mt5_secondary_shadow_preset(paths: dict[str, Path]) -> Path:
+    """Return the tracked source for the isolated USD-denominated observer preset."""
+
+    return paths["backend"] / MT5_SECONDARY_PRESET_SOURCE_RELATIVE
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -410,6 +450,67 @@ def _read_key_value_lists(path: Path) -> dict[str, list[str]]:
     return values
 
 
+def _preset_value_issues(
+    preset_values: dict[str, list[str]],
+    required_values: dict[str, str],
+    *,
+    code_prefix: str,
+) -> list[str]:
+    issues: list[str] = []
+    for key, expected in required_values.items():
+        candidates = preset_values.get(key.lower(), [])
+        if len(candidates) != 1 or candidates[0].lower() != expected.lower():
+            issues.append(f"{code_prefix}_{key.upper()}_INVALID")
+    forbidden_true_keys = (
+        "OrderSendAllowed",
+        "BrokerExecutionAllowed",
+        "LivePresetMutationAllowed",
+        "EnableLiveTrading",
+    )
+    for key in forbidden_true_keys:
+        candidates = preset_values.get(key.lower(), [])
+        if len(candidates) > 1:
+            issues.append(f"{code_prefix}_{key.upper()}_DUPLICATE")
+        if any(value.lower() in {"1", "true", "yes", "on"} for value in candidates):
+            issues.append(f"{code_prefix}_{key.upper()}_FORBIDDEN")
+    return issues
+
+
+def secondary_shadow_preset_source_issues(source: Path) -> list[str]:
+    """Validate the Backend-owned LiveSecondary source without exposing its content."""
+
+    issues: list[str] = []
+    if source.name != MT5_SECONDARY_PRESET_SOURCE_RELATIVE.name:
+        issues.append("MT5_SECONDARY_PRESET_SOURCE_NAME_INVALID")
+    if not source.is_absolute():
+        issues.append("MT5_SECONDARY_PRESET_SOURCE_PATH_INVALID")
+    elif source.is_symlink() or (
+        source.parent.exists() and source.parent.resolve() != source.parent.absolute()
+    ):
+        issues.append("MT5_SECONDARY_PRESET_SOURCE_SYMLINKED")
+    if not source.is_file():
+        issues.append("MT5_SECONDARY_PRESET_SOURCE_MISSING")
+    if issues:
+        return issues
+    try:
+        values = _read_key_value_lists(source)
+    except OSError:
+        return ["MT5_SECONDARY_PRESET_SOURCE_UNREADABLE"]
+    return _preset_value_issues(
+        values,
+        MT5_SECONDARY_REQUIRED_PRESET_VALUES,
+        code_prefix="MT5_SECONDARY_PRESET_SOURCE",
+    )
+
+
+def secondary_shadow_preset_directory_issues(target: Path) -> list[str]:
+    if not target.is_absolute() or not target.parent.is_dir():
+        return ["MT5_SECONDARY_PRESET_DIRECTORY_INVALID"]
+    if target.parent.is_symlink() or target.parent.resolve() != target.parent.absolute():
+        return ["MT5_SECONDARY_PRESET_DIRECTORY_SYMLINKED"]
+    return []
+
+
 def shadow_preset_guard_issues(
     config: Path,
     preset: Path,
@@ -417,6 +518,7 @@ def shadow_preset_guard_issues(
     *,
     expected_server: str = MT5_EXPECTED_BROKER_SERVER,
     expected_config_name: str = "QuantGod_MT5_HFM_Shadow_mac.ini",
+    required_preset_values: dict[str, str] | None = None,
 ) -> list[str]:
     """Return non-secret reason codes when the installed MT5 lane is not strictly Shadow."""
 
@@ -428,6 +530,12 @@ def shadow_preset_guard_issues(
         issues.append("MT5_SHADOW_PRESET_NAME_INVALID")
     if login_reference.name != "QuantGod_MT5_LoginOnly_mac.ini":
         issues.append("MT5_LOGIN_REFERENCE_NAME_INVALID")
+    if config.is_symlink():
+        issues.append("MT5_SHADOW_CONFIG_SYMLINKED")
+    if preset.is_symlink():
+        issues.append("MT5_SHADOW_PRESET_SYMLINKED")
+    if login_reference.is_symlink():
+        issues.append("MT5_LOGIN_REFERENCE_SYMLINKED")
     if not config.is_file():
         issues.append("MT5_SHADOW_CONFIG_MISSING")
     if not preset.is_file():
@@ -464,7 +572,7 @@ def shadow_preset_guard_issues(
         "AllowDllImport": "0",
         "ExpertParameters": "QuantGod_MT5_HFM_Shadow.set",
     }
-    required_preset = {
+    required_preset = required_preset_values or {
         "ShadowMode": "true",
         "ReadOnlyMode": "true",
         "EnablePilotAutoTrading": "false",
@@ -473,17 +581,20 @@ def shadow_preset_guard_issues(
         candidates = config_values.get(key.lower(), [])
         if len(candidates) != 1 or candidates[0].lower() != expected.lower():
             issues.append(f"MT5_SHADOW_CONFIG_{key.upper()}_INVALID")
-    for key, expected in required_preset.items():
-        candidates = preset_values.get(key.lower(), [])
-        if len(candidates) != 1 or candidates[0].lower() != expected.lower():
-            issues.append(f"MT5_SHADOW_PRESET_{key.upper()}_INVALID")
+    issues.extend(
+        _preset_value_issues(
+            preset_values,
+            required_preset,
+            code_prefix="MT5_SHADOW_PRESET",
+        )
+    )
     forbidden_true_keys = (
         "OrderSendAllowed",
         "BrokerExecutionAllowed",
         "LivePresetMutationAllowed",
         "EnableLiveTrading",
     )
-    for source_name, source_values in (("CONFIG", config_values), ("PRESET", preset_values)):
+    for source_name, source_values in (("CONFIG", config_values),):
         for key in forbidden_true_keys:
             candidates = source_values.get(key.lower(), [])
             if len(candidates) > 1:
@@ -550,6 +661,8 @@ def service_capability(
         issues.extend(shadow_preset_guard_issues(default_mt5_shadow_config(), default_mt5_shadow_preset()))
         issues.extend(local_user_environment_issues())
     elif name == "mt5-secondary-shadow-supervisor":
+        secondary_source = backend_mt5_secondary_shadow_preset(paths)
+        secondary_target = default_mt5_secondary_shadow_preset()
         require(default_mt5_wine_bin(), "MT5_WINE_MISSING", executable=True)
         require(default_mt5_secondary_terminal_path(), "MT5_SECONDARY_TERMINAL_MISSING")
         require(
@@ -563,15 +676,29 @@ def service_capability(
         require(default_mt5_verified_ea_source(), "MT5_VERIFIED_EA_SOURCE_MISSING")
         require(default_mt5_verified_ea_binary(), "MT5_VERIFIED_EA_BINARY_MISSING")
         require(default_mt5_verified_ea_compile_log(), "MT5_VERIFIED_EA_COMPILE_LOG_MISSING")
+        source_issues = secondary_shadow_preset_source_issues(secondary_source)
+        issues.extend(source_issues)
+        issues.extend(secondary_shadow_preset_directory_issues(secondary_target))
         issues.extend(
             shadow_preset_guard_issues(
                 default_mt5_secondary_shadow_config(),
-                default_mt5_secondary_shadow_preset(),
+                secondary_target,
                 default_mt5_secondary_login_reference_config(),
                 expected_server=MT5_SECONDARY_EXPECTED_BROKER_SERVER,
                 expected_config_name="QuantGod_MT5_HFM_SecondaryShadow_mac.ini",
+                required_preset_values=MT5_SECONDARY_REQUIRED_PRESET_VALUES,
             )
         )
+        if not source_issues and secondary_target.is_file():
+            try:
+                source_matches_target = hmac.compare_digest(
+                    secondary_source.read_bytes(), secondary_target.read_bytes()
+                )
+            except OSError:
+                issues.append("MT5_SECONDARY_SHADOW_PRESET_UNREADABLE")
+            else:
+                if not source_matches_target:
+                    issues.append("MT5_SECONDARY_SHADOW_PRESET_SOURCE_MISMATCH")
         issues.extend(local_user_environment_issues())
     elif name == "usdjpy-history-sync":
         require(backend / "tools/run_usdjpy_strategy_backtest.py", "HISTORY_SYNC_RUNNER_MISSING")
@@ -690,6 +817,9 @@ def render_env(
             default_mt5_secondary_login_reference_config()
         ),
         "QG_MT5_SECONDARY_SHADOW_PRESET": str(default_mt5_secondary_shadow_preset()),
+        "QG_MT5_SECONDARY_SHADOW_PRESET_SOURCE": str(
+            backend_mt5_secondary_shadow_preset(paths)
+        ),
         "QG_MT5_SECONDARY_SHADOW_CONFIG_WINDOWS": r"C:\qg\QuantGod_MT5_HFM_SecondaryShadow_mac.ini",
         "QG_MT5_SECONDARY_EXPECTED_SERVER": MT5_SECONDARY_EXPECTED_BROKER_SERVER,
         "QG_MT5_SECONDARY_PEER_ROOT": str(default_mt5_root()),
@@ -1328,6 +1458,9 @@ require_file "$QG_MT5_TERMINAL_PATH" "MT5_TERMINAL_MISSING"
 require_file "$QG_MT5_SHADOW_CONFIG" "MT5_SHADOW_CONFIG_MISSING"
 require_file "$QG_MT5_LOGIN_REFERENCE_CONFIG" "MT5_LOGIN_REFERENCE_MISSING"
 require_file "$QG_MT5_SHADOW_PRESET" "MT5_SHADOW_PRESET_MISSING"
+if [[ "$QG_SERVICE_NAME" == "mt5-secondary-shadow-supervisor" ]]; then
+  require_file "$QG_MT5_SHADOW_PRESET_SOURCE" "MT5_SECONDARY_PRESET_SOURCE_MISSING"
+fi
 require_file "$QG_MT5_ROOT/MQL5/Experts/QuantGod_MultiStrategy.mq5" "MT5_SHADOW_EA_SOURCE_MISSING"
 require_file "$QG_MT5_ROOT/MQL5/Experts/QuantGod_MultiStrategy.ex5" "MT5_SHADOW_EA_BINARY_MISSING"
 require_file "$QG_MT5_VERIFIED_EA_SOURCE" "MT5_VERIFIED_EA_SOURCE_MISSING"
@@ -1347,6 +1480,9 @@ for reviewed_path in \
   "$QG_MT5_VERIFIED_EA_COMPILE_LOG"; do
   assert_path_has_no_symlink_components "$reviewed_path"
 done
+if [[ "$QG_SERVICE_NAME" == "mt5-secondary-shadow-supervisor" ]]; then
+  assert_path_has_no_symlink_components "$QG_MT5_SHADOW_PRESET_SOURCE"
+fi
 if [[ "$QG_MT5_SECONDARY_SHADOW_ENABLED" == "1" ]]; then
   require_file "$QG_MT5_PEER_TERMINAL_PATH" "MT5_PEER_TERMINAL_MISSING"
   assert_path_has_no_symlink_components "$QG_MT5_PEER_ROOT"
@@ -1375,6 +1511,18 @@ assert_file_value_not_true "$QG_MT5_SHADOW_CONFIG" "EnableLiveTrading"
 assert_file_value "$QG_MT5_SHADOW_PRESET" "ShadowMode" "true"
 assert_file_value "$QG_MT5_SHADOW_PRESET" "ReadOnlyMode" "true"
 assert_file_value "$QG_MT5_SHADOW_PRESET" "EnablePilotAutoTrading" "false"
+if [[ "$QG_SERVICE_NAME" == "mt5-secondary-shadow-supervisor" ]]; then
+  expected_secondary_source="$QG_BACKEND_ROOT/MQL5/Presets/QuantGod_MT5_HFM_LiveSecondary.set"
+  [[ "$QG_MT5_SHADOW_PRESET_SOURCE" == "$expected_secondary_source" ]] || block_service "MT5_SECONDARY_PRESET_SOURCE_PATH_INVALID" "the secondary observer source is outside the reviewed Backend preset path"
+  /usr/bin/cmp -s "$QG_MT5_SHADOW_PRESET_SOURCE" "$QG_MT5_SHADOW_PRESET" || block_service "MT5_SECONDARY_SHADOW_PRESET_SOURCE_MISMATCH" "the deployed secondary observer preset differs from its reviewed source"
+  assert_file_value "$QG_MT5_SHADOW_PRESET" "Watchlist" "USDJPY"
+  assert_file_value "$QG_MT5_SHADOW_PRESET" "PreferredSymbolSuffix" "AUTO"
+  assert_file_value "$QG_MT5_SHADOW_PRESET" "EnablePilotRsiH1Live" "false"
+  assert_file_value "$QG_MT5_SHADOW_PRESET" "EnablePilotBBH1Live" "false"
+  assert_file_value "$QG_MT5_SHADOW_PRESET" "EnablePilotMacdH1Live" "false"
+  assert_file_value "$QG_MT5_SHADOW_PRESET" "EnablePilotSRM15Live" "false"
+  assert_file_value "$QG_MT5_SHADOW_PRESET" "EnableNonRsiLegacyLiveAuthorization" "false"
+fi
 assert_file_value_not_true "$QG_MT5_SHADOW_PRESET" "OrderSendAllowed"
 assert_file_value_not_true "$QG_MT5_SHADOW_PRESET" "BrokerExecutionAllowed"
 assert_file_value_not_true "$QG_MT5_SHADOW_PRESET" "LivePresetMutationAllowed"
@@ -1996,6 +2144,7 @@ QG_MT5_TERMINAL_PATH="$QG_MT5_SECONDARY_TERMINAL_PATH"
 QG_MT5_SHADOW_CONFIG="$QG_MT5_SECONDARY_SHADOW_CONFIG"
 QG_MT5_LOGIN_REFERENCE_CONFIG="$QG_MT5_SECONDARY_LOGIN_REFERENCE_CONFIG"
 QG_MT5_SHADOW_PRESET="$QG_MT5_SECONDARY_SHADOW_PRESET"
+QG_MT5_SHADOW_PRESET_SOURCE="$QG_MT5_SECONDARY_SHADOW_PRESET_SOURCE"
 QG_MT5_SHADOW_CONFIG_WINDOWS="$QG_MT5_SECONDARY_SHADOW_CONFIG_WINDOWS"
 QG_MT5_EXPECTED_SERVER="$QG_MT5_SECONDARY_EXPECTED_SERVER"
 QG_MT5_PEER_ROOT="$QG_MT5_SECONDARY_PEER_ROOT"
@@ -2251,11 +2400,86 @@ def discard_frontend_dist_rollback(snapshot: tuple[Path, Path | None]) -> None:
     shutil.rmtree(rollback)
 
 
+def snapshot_secondary_shadow_preset() -> tuple[bytes, int] | None:
+    """Capture only the isolated secondary preset for transactional rollback."""
+
+    target = default_mt5_secondary_shadow_preset()
+    directory_issues = secondary_shadow_preset_directory_issues(target)
+    if directory_issues:
+        raise RuntimeError(
+            "secondary Shadow preset directory is unsafe: "
+            + ",".join(directory_issues)
+        )
+    if target.is_symlink():
+        raise RuntimeError(f"refusing symlinked secondary Shadow preset: {target}")
+    if target.exists() and not target.is_file():
+        raise RuntimeError(f"refusing non-file secondary Shadow preset: {target}")
+    if not target.exists():
+        return None
+    return target.read_bytes(), stat.S_IMODE(target.stat().st_mode)
+
+
+def restore_secondary_shadow_preset(snapshot: tuple[bytes, int] | None) -> None:
+    target = default_mt5_secondary_shadow_preset()
+    directory_issues = secondary_shadow_preset_directory_issues(target)
+    if directory_issues:
+        raise RuntimeError(
+            "secondary Shadow preset directory is unsafe: "
+            + ",".join(directory_issues)
+        )
+    if target.is_symlink():
+        raise RuntimeError(f"refusing to restore over symlinked secondary Shadow preset: {target}")
+    if snapshot is None:
+        if target.exists():
+            if not target.is_file():
+                raise RuntimeError(f"refusing to remove non-file secondary Shadow preset: {target}")
+            target.unlink()
+        return
+    content, mode = snapshot
+    atomic_write_bytes(target, content, mode)
+
+
+def deploy_secondary_shadow_preset(paths: dict[str, Path]) -> Path:
+    """Atomically publish the reviewed USD/AUTO preset into the Live16 prefix."""
+
+    source = backend_mt5_secondary_shadow_preset(paths)
+    source_issues = secondary_shadow_preset_source_issues(source)
+    if source_issues:
+        raise RuntimeError(
+            "secondary Shadow preset source is unsafe: " + ",".join(sorted(source_issues))
+        )
+    target = default_mt5_secondary_shadow_preset()
+    directory_issues = secondary_shadow_preset_directory_issues(target)
+    if directory_issues:
+        raise RuntimeError(
+            "secondary Shadow preset directory is unsafe: "
+            + ",".join(directory_issues)
+        )
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise RuntimeError(f"secondary Shadow preset target is unsafe: {target}")
+    content = source.read_bytes()
+    atomic_write_bytes(target, content, PRIVATE_FILE_MODE)
+    if not hmac.compare_digest(content, target.read_bytes()):
+        raise RuntimeError("secondary Shadow preset publication verification failed")
+    deployed_issues = _preset_value_issues(
+        _read_key_value_lists(target),
+        MT5_SECONDARY_REQUIRED_PRESET_VALUES,
+        code_prefix="MT5_SHADOW_PRESET",
+    )
+    if deployed_issues:
+        raise RuntimeError(
+            "secondary Shadow preset publication violated its contract: "
+            + ",".join(sorted(deployed_issues))
+        )
+    return target
+
+
 def selected_capability_blockers(
     capabilities: dict[str, dict[str, Any]],
     selected_names: tuple[str, ...],
     *,
     allow_frontend_build_output: bool = False,
+    allow_secondary_preset_deploy: bool = False,
 ) -> list[dict[str, Any]]:
     blocked: list[dict[str, Any]] = []
     frontend_builder_ready = (
@@ -2272,6 +2496,13 @@ def selected_capability_blockers(
             and name == "backend-api"
             and frontend_builder_ready
             and reasons == {"COMPILED_FRONTEND_MISSING"}
+        ):
+            continue
+        if (
+            allow_secondary_preset_deploy
+            and name == "mt5-secondary-shadow-supervisor"
+            and reasons
+            and reasons <= MT5_SECONDARY_PRESET_DEPLOYABLE_REASONS
         ):
             continue
         blocked.append(row)
@@ -2336,6 +2567,9 @@ def install(args: argparse.Namespace) -> int:
     selected_names = SERVICE_PROFILES[args.profile]
     runtime_selected_names = tuple(name for name in selected_names if name != "frontend-dist-build")
     selected_labels = [SERVICES[name]["label"] for name in runtime_selected_names]
+    secondary_preset_deploy_selected = (
+        "mt5-secondary-shadow-supervisor" in runtime_selected_names
+    )
     capabilities = build_capability_report(paths, workspace=args.workspace)["services"]
     if args.no_load:
         print("QuantGod macOS launchd preflight (no files or services changed).")
@@ -2346,6 +2580,7 @@ def install(args: argparse.Namespace) -> int:
             capabilities,
             selected_names,
             allow_frontend_build_output=True,
+            allow_secondary_preset_deploy=secondary_preset_deploy_selected,
         )
         preview_blocked_names = {row["service"] for row in preview_blocked}
         frontend_builder_ready = capabilities.get("frontend-dist-build", {}).get("ready") is True
@@ -2359,18 +2594,26 @@ def install(args: argparse.Namespace) -> int:
             ):
                 status = "READY_AFTER_BUILD"
                 reasons = "compiled Frontend will be produced before service switch"
+            elif (
+                row["service"] == "mt5-secondary-shadow-supervisor"
+                and set(row["reasonCodes"])
+                and set(row["reasonCodes"]) <= MT5_SECONDARY_PRESET_DEPLOYABLE_REASONS
+            ):
+                status = "READY_AFTER_PRESET_DEPLOY"
+                reasons = "reviewed Backend USDJPY/AUTO preset will be atomically deployed"
             print(f"  {row['service']}: {status} - {reasons}")
         print("--no-load performed capability inspection only; it wrote no env, wrapper, plist, or status file.")
         if preview_blocked_names:
             print("Preflight BLOCKED: " + ", ".join(sorted(preview_blocked_names)))
             return 2
-        print("Preflight READY: all dependencies exist or are synchronously buildable.")
+        print("Preflight READY: all dependencies exist or are synchronously buildable/deployable.")
         return 0
 
     blocked = selected_capability_blockers(
         capabilities,
         selected_names,
         allow_frontend_build_output=True,
+        allow_secondary_preset_deploy=secondary_preset_deploy_selected,
     )
     if blocked:
         details = "; ".join(
@@ -2390,6 +2633,7 @@ def install(args: argparse.Namespace) -> int:
             capabilities,
             selected_names,
             allow_frontend_build_output=True,
+            allow_secondary_preset_deploy=secondary_preset_deploy_selected,
         )
         if blocked:
             details = "; ".join(
@@ -2403,6 +2647,11 @@ def install(args: argparse.Namespace) -> int:
 
     previous_loaded = [label for label in all_labels if is_loaded(label)]
     previous_files = snapshot_managed_files()
+    secondary_preset_snapshot = (
+        snapshot_secondary_shadow_preset()
+        if secondary_preset_deploy_selected
+        else None
+    )
     loaded_labels: list[str] = []
     frontend_snapshot: tuple[Path, Path | None] | None = None
     try:
@@ -2411,6 +2660,9 @@ def install(args: argparse.Namespace) -> int:
         if frontend_build_selected:
             frontend_snapshot = stage_frontend_dist_rollback(paths)
             publish_frontend_dist(paths, args.workspace)
+        if secondary_preset_deploy_selected:
+            deploy_secondary_shadow_preset(paths)
+        if frontend_build_selected or secondary_preset_deploy_selected:
             capabilities = build_capability_report(paths, workspace=args.workspace)["services"]
             blocked = selected_capability_blockers(capabilities, selected_names)
             if blocked:
@@ -2418,7 +2670,10 @@ def install(args: argparse.Namespace) -> int:
                     f"{row['service']}={','.join(row['reasonCodes'])}"
                     for row in blocked
                 )
-                raise RuntimeError("frontend publication completed but final capability preflight is blocked: " + details)
+                raise RuntimeError(
+                    "staged publication completed but final capability preflight is blocked: "
+                    + details
+                )
         write_files(
             args.workspace,
             resolved_paths=paths,
@@ -2445,6 +2700,11 @@ def install(args: argparse.Namespace) -> int:
                 restore_frontend_dist(frontend_snapshot)
             except Exception as exc:
                 rollback_errors.append(f"Frontend dist restore failed: {exc}")
+        if secondary_preset_deploy_selected:
+            try:
+                restore_secondary_shadow_preset(secondary_preset_snapshot)
+            except Exception as exc:
+                rollback_errors.append(f"secondary Shadow preset restore failed: {exc}")
         stop_failed = any(message.startswith("service stop failed") for message in rollback_errors)
         if not stop_failed:
             for label in previous_loaded:

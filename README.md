@@ -95,8 +95,12 @@ before any managed-file or launchd state change if a selected capability is
 `BLOCKED`. During a real install, Frontend build completes before Backend is
 stopped; atomic `/vue` publication then completes while it is stopped and before
 restart. Managed files are published with `fsync` plus atomic replace; if final
-capability or service activation fails, the previous `/vue`, managed files, and
-previously loaded QuantGod profile are restored.
+capability or service activation fails, the previous `/vue`, managed files,
+secondary observer preset, and previously loaded QuantGod profile are restored.
+For `local-dual-shadow`, a safe Backend preset source can appear as
+`READY_AFTER_PRESET_DEPLOY` in `--no-load`; preflight remains read-only and the
+copy occurs only after both MT5 supervisors have been stopped during a real
+transactional install.
 
 `local-shadow` uses the compiled Frontend served by Backend `/vue`; it does not
 load the Vite development server, Daily Autopilot, Telegram, or DeepSeek. It
@@ -139,7 +143,17 @@ that merely carries `--terminal-path /.../terminal64.exe` is not an MT5 process.
 `QuantGod_MT5_HFM_SecondaryShadow_mac.ini` signature. Each supervisor classifies
 processes by canonical Wine-prefix root and exact config argument, permits only
 the other reviewed prefix, and keeps separate singleton/status files. Installed
-EA source and binary must match the same clean verified build staging artifacts;
+secondary preset content is sourced only from Backend
+`MQL5/Presets/QuantGod_MT5_HFM_LiveSecondary.set` and atomically published as
+`QuantGod_MT5_HFM_Shadow.set` inside the isolated Live16 prefix. The filename is
+kept because the private Shadow config references it, but the full path and
+source are independent from the Live12 cent preset. Capability and runtime
+guards require an exact source match plus `Watchlist=USDJPY`,
+`PreferredSymbolSuffix=AUTO`, `ShadowMode=true`, `ReadOnlyMode=true`,
+`EnablePilotAutoTrading=false`, and every reviewed live-route authorization to
+remain false; `USDJPYc`, suffix `c`, preset drift, or any trading enablement
+blocks Wine before launch. Installed EA source and binary must match the same
+clean verified build staging artifacts;
 the source is scanned for Trade.mqh, CTrade, OrderSend, and raw trade actions
 before either terminal starts. The private `drive_c/qg/compile.log` must identify
 the reviewed staging source, report zero errors and warnings, contain no broker
@@ -236,6 +250,7 @@ QG_MT5_LOGIN_REFERENCE_CONFIG=<private same-prefix QuantGod_MT5_LoginOnly_mac.in
 QG_MT5_SECONDARY_ENABLED=0
 QG_MT5_SECONDARY_SHADOW_ENABLED=<0 for local-shadow; 1 for local-dual-shadow>
 QG_MT5_SECONDARY_ALLOW_LIVE_TRADING=0
+QG_MT5_SECONDARY_SHADOW_PRESET_SOURCE=<Backend MQL5/Presets/QuantGod_MT5_HFM_LiveSecondary.set>
 QG_USDJPY_HISTORY_SYNC_ENABLED=1
 QG_USDJPY_HISTORY_INTERVAL_SECONDS=3600
 QG_TELEGRAM_PUSH_ALLOWED=0

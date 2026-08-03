@@ -406,6 +406,10 @@ class MacLaunchdHelperTests(unittest.TestCase):
         )
         self.assertIn("QG_MT5_SECONDARY_SHADOW_ENABLED='1'", dual_env)
         self.assertIn("QG_MT5_SECONDARY_ENABLED='0'", dual_env)
+        self.assertIn(
+            "QG_MT5_SECONDARY_SHADOW_PRESET_SOURCE='b/MQL5/Presets/QuantGod_MT5_HFM_LiveSecondary.set'",
+            dual_env,
+        )
 
     def test_install_rolls_back_services_loaded_before_bootstrap_failure(self) -> None:
         args = launchd.build_parser().parse_args(["install", "--profile", "core"])
@@ -581,6 +585,59 @@ class MacLaunchdHelperTests(unittest.TestCase):
         discard.assert_not_called()
         self.assertEqual(bootstrap_calls, [backend_label, backend_label])
 
+    def test_dual_shadow_activation_failure_restores_secondary_preset(self) -> None:
+        args = launchd.build_parser().parse_args(["install", "--profile", "local-dual-shadow"])
+        paths = {
+            "backend": pathlib.Path("b"),
+            "frontend": pathlib.Path("f"),
+            "infra": pathlib.Path("i"),
+            "docs": pathlib.Path("d"),
+        }
+        report = {
+            "services": {
+                name: {"service": name, "ready": True, "status": "READY", "reasonCodes": []}
+                for name in launchd.SERVICES
+            }
+        }
+        preset_snapshot = (b"old-secondary-preset", 0o600)
+        backend_label = launchd.SERVICES["backend-api"]["label"]
+
+        def fail_backend_activation(label: str) -> None:
+            if label == backend_label:
+                raise RuntimeError("activation failed")
+
+        with (
+            mock.patch.object(launchd, "load_workspace", return_value=paths),
+            mock.patch.object(launchd, "build_capability_report", return_value=report),
+            mock.patch.object(launchd, "build_frontend_dist"),
+            mock.patch.object(
+                launchd,
+                "stage_frontend_dist_rollback",
+                return_value=(pathlib.Path("active"), None),
+            ),
+            mock.patch.object(launchd, "publish_frontend_dist"),
+            mock.patch.object(launchd, "restore_frontend_dist"),
+            mock.patch.object(launchd, "is_loaded", return_value=False),
+            mock.patch.object(launchd, "snapshot_managed_files", return_value={}),
+            mock.patch.object(
+                launchd,
+                "snapshot_secondary_shadow_preset",
+                return_value=preset_snapshot,
+            ) as snapshot_preset,
+            mock.patch.object(launchd, "deploy_secondary_shadow_preset") as deploy_preset,
+            mock.patch.object(launchd, "restore_secondary_shadow_preset") as restore_preset,
+            mock.patch.object(launchd, "restore_managed_files"),
+            mock.patch.object(launchd, "write_files", return_value=paths),
+            mock.patch.object(launchd, "bootout"),
+            mock.patch.object(launchd, "bootstrap", side_effect=fail_backend_activation),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "activation failed"):
+                launchd.install(args)
+
+        snapshot_preset.assert_called_once_with()
+        deploy_preset.assert_called_once_with(paths)
+        restore_preset.assert_called_once_with(preset_snapshot)
+
     def test_missing_compiled_frontend_is_buildable_before_final_preflight(self) -> None:
         selected = launchd.SERVICE_PROFILES["local-shadow"]
         capabilities = {
@@ -604,6 +661,49 @@ class MacLaunchdHelperTests(unittest.TestCase):
         self.assertEqual(
             [row["service"] for row in launchd.selected_capability_blockers(capabilities, selected)],
             ["backend-api"],
+        )
+
+    def test_secondary_preset_drift_is_synchronously_deployable_only_for_dual_profile(self) -> None:
+        selected = launchd.SERVICE_PROFILES["local-dual-shadow"]
+        capabilities = {
+            name: {"service": name, "ready": True, "status": "READY", "reasonCodes": []}
+            for name in launchd.SERVICES
+        }
+        capabilities["mt5-secondary-shadow-supervisor"] = {
+            "service": "mt5-secondary-shadow-supervisor",
+            "ready": False,
+            "status": "BLOCKED",
+            "reasonCodes": [
+                "MT5_SECONDARY_SHADOW_PRESET_SOURCE_MISMATCH",
+                "MT5_SHADOW_PRESET_WATCHLIST_INVALID",
+                "MT5_SHADOW_PRESET_PREFERREDSYMBOLSUFFIX_INVALID",
+            ],
+        }
+        self.assertEqual(
+            launchd.selected_capability_blockers(
+                capabilities,
+                selected,
+                allow_secondary_preset_deploy=True,
+            ),
+            [],
+        )
+        self.assertEqual(
+            [row["service"] for row in launchd.selected_capability_blockers(capabilities, selected)],
+            ["mt5-secondary-shadow-supervisor"],
+        )
+        capabilities["mt5-secondary-shadow-supervisor"]["reasonCodes"].append(
+            "MT5_SECONDARY_PRESET_SOURCE_WATCHLIST_INVALID"
+        )
+        self.assertEqual(
+            [
+                row["service"]
+                for row in launchd.selected_capability_blockers(
+                    capabilities,
+                    selected,
+                    allow_secondary_preset_deploy=True,
+                )
+            ],
+            ["mt5-secondary-shadow-supervisor"],
         )
 
     def test_history_sync_wrapper_runs_sync_klines_once(self) -> None:
@@ -716,6 +816,14 @@ class MacLaunchdHelperTests(unittest.TestCase):
         self.assertIn(launchd.MT5_SECONDARY_EXPECTED_BROKER_SERVER, secondary_mt5)
         self.assertNotIn(launchd.MT5_EXPECTED_BROKER_SERVER, secondary_mt5)
         self.assertIn('QG_SERVICE_NAME="mt5-secondary-shadow-supervisor"', secondary_mt5)
+        self.assertIn("QuantGod_MT5_HFM_LiveSecondary.set", secondary_mt5)
+        self.assertIn('assert_file_value "$QG_MT5_SHADOW_PRESET" "Watchlist" "USDJPY"', secondary_mt5)
+        self.assertIn(
+            'assert_file_value "$QG_MT5_SHADOW_PRESET" "PreferredSymbolSuffix" "AUTO"',
+            secondary_mt5,
+        )
+        self.assertIn("MT5_SECONDARY_SHADOW_PRESET_SOURCE_MISMATCH", secondary_mt5)
+        self.assertNotIn('"Watchlist" "USDJPYc"', secondary_mt5)
 
         automation = wrappers["quantgod-automation-chain.sh"]
         self.assertIn("did not return a non-empty step list", automation)
@@ -1143,6 +1251,79 @@ class MacLaunchdHelperTests(unittest.TestCase):
             issues = launchd.shadow_preset_guard_issues(config, preset)
             self.assertIn("MT5_SHADOW_CONFIG_ENABLELIVETRADING_DUPLICATE", issues)
             self.assertIn("MT5_SHADOW_CONFIG_ENABLELIVETRADING_FORBIDDEN", issues)
+
+    def test_secondary_shadow_contract_rejects_cent_symbols_and_live_routes(self) -> None:
+        safe_text = "\n".join(
+            f"{key}={value}"
+            for key, value in launchd.MT5_SECONDARY_REQUIRED_PRESET_VALUES.items()
+        ) + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            source = pathlib.Path(tmp).resolve() / launchd.MT5_SECONDARY_PRESET_SOURCE_RELATIVE.name
+            source.write_text(safe_text, encoding="utf-8")
+            self.assertEqual(launchd.secondary_shadow_preset_source_issues(source), [])
+
+            source.write_text(
+                safe_text.replace("Watchlist=USDJPY", "Watchlist=USDJPYc").replace(
+                    "PreferredSymbolSuffix=AUTO", "PreferredSymbolSuffix=c"
+                ),
+                encoding="utf-8",
+            )
+            issues = launchd.secondary_shadow_preset_source_issues(source)
+            self.assertIn("MT5_SECONDARY_PRESET_SOURCE_WATCHLIST_INVALID", issues)
+            self.assertIn("MT5_SECONDARY_PRESET_SOURCE_PREFERREDSYMBOLSUFFIX_INVALID", issues)
+
+            source.write_text(
+                safe_text.replace("EnablePilotRsiH1Live=false", "EnablePilotRsiH1Live=true"),
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "MT5_SECONDARY_PRESET_SOURCE_ENABLEPILOTRSIH1LIVE_INVALID",
+                launchd.secondary_shadow_preset_source_issues(source),
+            )
+
+    def test_secondary_shadow_preset_deploy_is_isolated_atomic_and_reversible(self) -> None:
+        safe_text = "\n".join(
+            f"{key}={value}"
+            for key, value in launchd.MT5_SECONDARY_REQUIRED_PRESET_VALUES.items()
+        ) + "\n"
+        old_text = (
+            "Watchlist=USDJPYc\nPreferredSymbolSuffix=c\n"
+            "ShadowMode=true\nReadOnlyMode=true\nEnablePilotAutoTrading=false\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp).resolve()
+            backend = root / "QuantGodBackend"
+            source = backend / launchd.MT5_SECONDARY_PRESET_SOURCE_RELATIVE
+            source.parent.mkdir(parents=True)
+            source.write_text(safe_text, encoding="utf-8")
+            target = root / "live16/MQL5/Presets/QuantGod_MT5_HFM_Shadow.set"
+            target.parent.mkdir(parents=True)
+            target.write_text(old_text, encoding="utf-8")
+            target.chmod(0o640)
+            primary = root / "live12/MQL5/Presets/QuantGod_MT5_HFM_Shadow.set"
+            primary.parent.mkdir(parents=True)
+            primary.write_text("primary-cent-preset", encoding="utf-8")
+            paths = {
+                "backend": backend,
+                "frontend": root / "QuantGodFrontend",
+                "infra": root / "QuantGodInfra",
+                "docs": root / "QuantGodDocs",
+            }
+
+            with mock.patch.object(
+                launchd,
+                "default_mt5_secondary_shadow_preset",
+                return_value=target,
+            ):
+                snapshot = launchd.snapshot_secondary_shadow_preset()
+                self.assertEqual(launchd.deploy_secondary_shadow_preset(paths), target)
+                self.assertEqual(target.read_bytes(), source.read_bytes())
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+                self.assertEqual(primary.read_text(encoding="utf-8"), "primary-cent-preset")
+                launchd.restore_secondary_shadow_preset(snapshot)
+
+            self.assertEqual(target.read_text(encoding="utf-8"), old_text)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
 
     def test_shadow_preset_guard_requires_one_exact_hfm_broker_server(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
