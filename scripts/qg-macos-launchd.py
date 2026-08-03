@@ -23,7 +23,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 INFRA_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WORKSPACE = INFRA_ROOT / "workspace" / "quantgod.workspace.json"
@@ -2415,6 +2415,52 @@ def restore_managed_files(snapshot: dict[Path, tuple[bytes, int] | None]) -> Non
         atomic_write_bytes(path, content, mode)
 
 
+def prune_unselected_launch_agent_definitions(
+    selected_labels: Iterable[str],
+) -> tuple[Path, ...]:
+    """Remove only known QuantGod plists that are inactive in this profile.
+
+    The caller snapshots every managed definition before publication, so a
+    later activation failure can restore the previous profile atomically.  Do
+    not scan the LaunchAgents directory: an exact allow-list prevents this
+    cleanup from touching third-party or retired, manually managed plists.
+    """
+
+    known_labels = {str(service["label"]) for service in SERVICES.values()}
+    selected = set(selected_labels)
+    unknown = sorted(selected - known_labels)
+    if unknown:
+        raise RuntimeError(
+            "refusing to prune LaunchAgent definitions for unknown labels: "
+            + ",".join(unknown)
+        )
+    invalid = sorted(
+        label for label in known_labels if not label.startswith(f"{LABEL_PREFIX}.")
+    )
+    if invalid:
+        raise RuntimeError(
+            "refusing to prune LaunchAgent definitions outside the QuantGod namespace: "
+            + ",".join(invalid)
+        )
+
+    removed: list[Path] = []
+    for label in sorted(known_labels - selected):
+        definition = plist_path(label)
+        if definition.is_symlink():
+            raise RuntimeError(
+                f"refusing to prune symlinked QuantGod LaunchAgent: {definition}"
+            )
+        if not definition.exists():
+            continue
+        if not definition.is_file():
+            raise RuntimeError(
+                f"refusing to prune non-file QuantGod LaunchAgent: {definition}"
+            )
+        definition.unlink()
+        removed.append(definition)
+    return tuple(removed)
+
+
 def build_frontend_dist(paths: dict[str, Path]) -> None:
     """Compile Frontend without changing the Backend's active /vue tree."""
     npm_bin = which("npm", "/usr/bin/npm")
@@ -2647,6 +2693,7 @@ def write_files(
     *,
     resolved_paths: dict[str, Path] | None = None,
     secondary_shadow_enabled: bool = False,
+    selected_launch_agent_labels: Iterable[str] | None = None,
 ) -> dict[str, Path]:
     paths = resolved_paths or load_workspace(workspace)
     harden_private_directory(PRIVATE_ROOT)
@@ -2690,6 +2737,8 @@ def write_files(
         json.dumps(capability_report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         PRIVATE_FILE_MODE,
     )
+    if selected_launch_agent_labels is not None:
+        prune_unselected_launch_agent_definitions(selected_launch_agent_labels)
     harden_log_files()
     return paths
 
@@ -2827,6 +2876,7 @@ def install(args: argparse.Namespace) -> int:
             args.workspace,
             resolved_paths=paths,
             secondary_shadow_enabled="mt5-secondary-shadow-supervisor" in runtime_selected_names,
+            selected_launch_agent_labels=selected_labels,
         )
         for label in selected_labels:
             bootstrap(label)

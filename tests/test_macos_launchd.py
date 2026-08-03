@@ -487,7 +487,11 @@ class MacLaunchdHelperTests(unittest.TestCase):
             mock.patch.object(launchd, "discard_frontend_dist_rollback", side_effect=lambda *_: events.append("discard")),
             mock.patch.object(launchd, "is_loaded", return_value=False),
             mock.patch.object(launchd, "snapshot_managed_files", return_value={}),
-            mock.patch.object(launchd, "write_files", side_effect=lambda *_args, **_kwargs: events.append("publish") or paths),
+            mock.patch.object(
+                launchd,
+                "write_files",
+                side_effect=lambda *_args, **_kwargs: events.append("publish") or paths,
+            ) as write_files,
             mock.patch.object(launchd, "bootout", side_effect=lambda _label, **_kwargs: events.append("bootout")),
             mock.patch.object(launchd, "bootstrap", side_effect=lambda label: events.append(f"bootstrap:{label}")),
         ):
@@ -501,6 +505,85 @@ class MacLaunchdHelperTests(unittest.TestCase):
         self.assertLess(events.index("publish"), events.index(backend_event))
         self.assertGreater(events.index("discard"), events.index(backend_event))
         self.assertFalse(any("frontend-dist-build" in event for event in events if event.startswith("bootstrap:")))
+        self.assertEqual(
+            write_files.call_args.kwargs["selected_launch_agent_labels"],
+            [
+                launchd.SERVICES[name]["label"]
+                for name in launchd.SERVICE_PROFILES["local-shadow"]
+                if name != "frontend-dist-build"
+            ],
+        )
+
+    def test_profile_definition_pruning_removes_only_known_unselected_plists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launch_agent_dir = pathlib.Path(tmp) / "LaunchAgents"
+            launch_agent_dir.mkdir()
+            primary_label = launchd.SERVICES["mt5-shadow-supervisor"]["label"]
+            secondary_label = launchd.SERVICES["mt5-secondary-shadow-supervisor"]["label"]
+            primary = launch_agent_dir / f"{primary_label}.plist"
+            secondary = launch_agent_dir / f"{secondary_label}.plist"
+            third_party = launch_agent_dir / "com.example.keep.plist"
+            unmanaged_quantgod = launch_agent_dir / "com.quantgod.retired-manual.plist"
+            for path in (primary, secondary, third_party, unmanaged_quantgod):
+                path.write_text(path.name, encoding="utf-8")
+
+            with mock.patch.object(launchd, "LAUNCH_AGENT_DIR", launch_agent_dir):
+                removed = launchd.prune_unselected_launch_agent_definitions([primary_label])
+
+            self.assertEqual(removed, (secondary,))
+            self.assertTrue(primary.is_file())
+            self.assertFalse(secondary.exists())
+            self.assertTrue(third_party.is_file())
+            self.assertTrue(unmanaged_quantgod.is_file())
+
+    def test_profile_definition_pruning_rejects_symlinked_known_plist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            launch_agent_dir = root / "LaunchAgents"
+            launch_agent_dir.mkdir()
+            target = root / "target.plist"
+            target.write_text("do not remove", encoding="utf-8")
+            secondary_label = launchd.SERVICES["mt5-secondary-shadow-supervisor"]["label"]
+            secondary = launch_agent_dir / f"{secondary_label}.plist"
+            secondary.symlink_to(target)
+
+            with (
+                mock.patch.object(launchd, "LAUNCH_AGENT_DIR", launch_agent_dir),
+                self.assertRaisesRegex(RuntimeError, "refusing to prune symlinked"),
+            ):
+                launchd.prune_unselected_launch_agent_definitions([])
+
+            self.assertTrue(secondary.is_symlink())
+            self.assertEqual(target.read_text(encoding="utf-8"), "do not remove")
+
+    def test_managed_snapshot_restores_pruned_profile_definition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            launch_agent_dir = root / "LaunchAgents"
+            bin_dir = root / "private" / "bin"
+            env_path = root / "private" / "launchd.env"
+            capability_path = root / "private" / "status" / "capabilities.json"
+            launch_agent_dir.mkdir(parents=True)
+            bin_dir.mkdir(parents=True)
+            secondary_label = launchd.SERVICES["mt5-secondary-shadow-supervisor"]["label"]
+            secondary = launch_agent_dir / f"{secondary_label}.plist"
+            secondary.write_bytes(b"previous secondary definition")
+            secondary.chmod(0o600)
+            primary_label = launchd.SERVICES["mt5-shadow-supervisor"]["label"]
+
+            with (
+                mock.patch.object(launchd, "LAUNCH_AGENT_DIR", launch_agent_dir),
+                mock.patch.object(launchd, "BIN_DIR", bin_dir),
+                mock.patch.object(launchd, "ENV_PATH", env_path),
+                mock.patch.object(launchd, "CAPABILITY_PATH", capability_path),
+            ):
+                snapshot = launchd.snapshot_managed_files()
+                launchd.prune_unselected_launch_agent_definitions([primary_label])
+                self.assertFalse(secondary.exists())
+                launchd.restore_managed_files(snapshot)
+
+            self.assertEqual(secondary.read_bytes(), b"previous secondary definition")
+            self.assertEqual(stat.S_IMODE(secondary.stat().st_mode), 0o600)
 
     def test_local_shadow_capability_drift_after_build_blocks_before_service_switch(self) -> None:
         args = launchd.build_parser().parse_args(["install", "--profile", "local-shadow"])

@@ -98,6 +98,12 @@ restart. Managed files are published with `fsync` plus atomic replace; if final
 capability or service activation fails, the previous `/vue`, managed files,
 secondary observer preset/EA artifacts, and previously loaded QuantGod profile
 are restored.
+After managed publication, the installer removes the plist definition for each
+known QuantGod service that is not active in the selected profile. This prevents
+an inactive `RunAtLoad`/`KeepAlive` agent from returning at the next login. The
+cleanup uses the exact labels declared by this installer, never scans or removes
+third-party LaunchAgents, remains covered by the managed-file rollback snapshot,
+and does not delete an MT5 Wine prefix, account data, preset, or EA artifact.
 For `local-dual-shadow`, a safe Backend preset source can appear as
 `READY_AFTER_PRESET_DEPLOY`, while verified EA drift can appear as
 `READY_AFTER_EA_DEPLOY` (or the combined `READY_AFTER_SECONDARY_DEPLOY`) in
