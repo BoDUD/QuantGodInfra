@@ -1129,6 +1129,46 @@ def _rename_path(source: pathlib.Path, destination: pathlib.Path) -> None:
     source.rename(destination)
 
 
+def _prune_previous_frontend_dists(
+    backend_dist: pathlib.Path,
+    *,
+    keep: int = 1,
+    preserve: pathlib.Path | None = None,
+) -> tuple[pathlib.Path, ...]:
+    """Bound exact, completed Frontend rollback copies after publication."""
+
+    if keep < 1:
+        raise ValueError("at least one previous Frontend dist must be retained")
+    parent = backend_dist.parent.resolve(strict=True)
+    pattern = re.compile(rf"^{re.escape(backend_dist.name)}\.previous-[0-9a-f]{{32}}$")
+    candidates: list[pathlib.Path] = []
+    for candidate in backend_dist.parent.glob(f"{backend_dist.name}.previous-*"):
+        if not pattern.fullmatch(candidate.name):
+            continue
+        if candidate.is_symlink():
+            fail(f"refusing symlinked previous frontend dist: {candidate}")
+        if not candidate.is_dir():
+            fail(f"previous frontend dist is not a directory: {candidate}")
+        resolved = candidate.resolve(strict=True)
+        if resolved.parent != parent:
+            fail(f"previous frontend dist escaped its managed parent: {candidate}")
+        candidates.append(candidate)
+
+    candidates.sort(
+        key=lambda path: (
+            path == preserve,
+            path.stat().st_mtime_ns,
+            path.name,
+        ),
+        reverse=True,
+    )
+    removed: list[pathlib.Path] = []
+    for candidate in candidates[keep:]:
+        shutil.rmtree(candidate)
+        removed.append(candidate)
+    return tuple(removed)
+
+
 def cmd_sync_frontend_dist(ws: dict[str, Any]) -> None:
     if not ws.get("copyFrontendDistToBackend", True):
         print("frontend dist sync disabled by workspace config")
@@ -1177,9 +1217,16 @@ def cmd_sync_frontend_dist(ws: dict[str, Any]) -> None:
         if staging_dist.exists():
             shutil.rmtree(staging_dist)
 
+    pruned_backups = _prune_previous_frontend_dists(
+        backend_dist,
+        keep=1,
+        preserve=promoted_backup,
+    )
     print(f"synced and verified {frontend_dist} -> {backend_dist}")
     if promoted_backup:
         print(f"previous frontend dist preserved at {promoted_backup}")
+    if pruned_backups:
+        print(f"pruned {len(pruned_backups)} older previous frontend dist backup(s)")
 
 
 def cmd_closed_loop(ws: dict[str, Any]) -> None:

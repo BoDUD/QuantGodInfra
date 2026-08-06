@@ -161,6 +161,13 @@ SERVICES: dict[str, dict[str, Any]] = {
         "interval": 3600,
         "description": "Independent local runtime and launchd log rotation",
     },
+    "disk-maintenance": {
+        "label": f"{LABEL_PREFIX}.disk-maintenance",
+        "wrapper": "quantgod-disk-maintenance.sh",
+        "kind": "interval",
+        "interval": 3600,
+        "description": "Bounded local QuantGod disk-pressure maintenance",
+    },
     "sqlite-backup": {
         "label": f"{LABEL_PREFIX}.sqlite-backup",
         "wrapper": "quantgod-sqlite-backup.sh",
@@ -189,6 +196,7 @@ SERVICE_PROFILES: dict[str, tuple[str, ...]] = {
         "automation-chain",
         "health-maintenance",
         "log-maintenance",
+        "disk-maintenance",
         "sqlite-backup",
     ),
     "local-dual-shadow": (
@@ -200,6 +208,7 @@ SERVICE_PROFILES: dict[str, tuple[str, ...]] = {
         "automation-chain",
         "health-maintenance",
         "log-maintenance",
+        "disk-maintenance",
         "sqlite-backup",
     ),
     "research": (
@@ -209,6 +218,7 @@ SERVICE_PROFILES: dict[str, tuple[str, ...]] = {
         "automation-chain",
         "health-maintenance",
         "log-maintenance",
+        "disk-maintenance",
         "sqlite-backup",
     ),
     "all": tuple(SERVICES),
@@ -784,6 +794,8 @@ def service_capability(
         require(backend / "Dashboard/health_api_routes.js", "HEALTH_ENDPOINT_ROUTES_MISSING")
     elif name == "log-maintenance":
         require(backend / "tools/maintain_runtime_logs.py", "LOG_MAINTENANCE_RUNNER_MISSING")
+    elif name == "disk-maintenance":
+        require(backend / "tools/maintain_disk_space.py", "DISK_MAINTENANCE_RUNNER_MISSING")
     elif name == "sqlite-backup":
         require(backend / "tools/run_local_shadow_backup.py", "SQLITE_BACKUP_RUNNER_MISSING")
         require(runtime / "QuantGod_MT5Platform.db", "PLATFORM_DB_MISSING")
@@ -935,12 +947,29 @@ def render_env(
         "QG_MT5_AI_DEEPSEEK_ENABLED": "0",
         "QG_AUTOMATION_SYMBOLS": "USDJPYc",
         "QG_AUTOMATION_MAX_AGE_SECONDS": "180",
+        "QG_DISK_WARN_FREE_PERCENT": "20",
+        "QG_DISK_CRITICAL_FREE_PERCENT": "10",
+        "QG_DISK_TARGET_FREE_PERCENT": "12",
+        "QG_DISK_HISTORY_RETENTION_DAYS": "14",
+        "QG_DISK_PRESSURE_RETENTION_DAYS": "3",
+        "QG_DISK_HISTORY_KEEP": "500",
+        "QG_DISK_PRESSURE_HISTORY_KEEP": "100",
+        "QG_DISK_STALE_TEMP_HOURS": "24",
+        "QG_DISK_MAX_DELETE_MB_PER_RUN": "2048",
+        "QG_DISK_MAX_DELETE_FILES_PER_RUN": "500",
+        "QG_DISK_MAINTENANCE_FRESH_SECONDS": "7200",
+        "QG_DISK_MAINTENANCE_STATUS_FILE": str(
+            STATUS_DIR / "QuantGod_DiskSpaceMaintenanceStatus.json"
+        ),
+        "QG_DISK_MAINTENANCE_LOCK_FILE": str(
+            LOCK_DIR / "disk-space-maintenance.lock"
+        ),
         "QG_SQLITE_BACKUP_KEEP": "3",
         "QG_RUNTIME_LOG_MAX_MB": "32",
-        "QG_RUNTIME_LOG_ARCHIVE_MAX_MB": "1024",
+        "QG_RUNTIME_LOG_ARCHIVE_MAX_MB": "512",
         "QG_RUNTIME_LOG_RETENTION_DAYS": "14",
         "QG_RUNTIME_JSONL_MAX_MB": "8",
-        "QG_RUNTIME_JSONL_ARCHIVE_MAX_MB": "1024",
+        "QG_RUNTIME_JSONL_ARCHIVE_MAX_MB": "512",
         "QG_RUNTIME_JSONL_KEEP_LINES": "5000",
         "QG_MT5_AI_MONITOR_SYMBOLS": "USDJPYc",
         "QG_MT5_AI_MONITOR_TIMEFRAMES": "M15,H1,H4,D1",
@@ -2053,6 +2082,451 @@ fi
   --retention-days "$QG_RUNTIME_LOG_RETENTION_DAYS" \
   --no-jsonl-maintenance
 finish_service "PASS" "LOG_MAINTENANCE_COMPLETE" "Backend runtime, MT5 evidence, and launchd log maintenance completed"
+''',
+        "quantgod-disk-maintenance.sh": wrapper_header("disk-maintenance")
+        + r'''
+require_file "$QG_BACKEND_ROOT/tools/maintain_disk_space.py" "DISK_MAINTENANCE_RUNNER_MISSING"
+backend_runtime="$QG_BACKEND_ROOT/runtime"
+for root in \
+  "$QG_BACKEND_ROOT" \
+  "$backend_runtime" \
+  "$QG_MT5_ROOT" \
+  "$QG_RUNTIME_DIR" \
+  "$QG_MT5_FILES_DIR" \
+  "$QG_PRIVATE_ROOT" \
+  "$QG_LAUNCHD_STATUS_ROOT" \
+  "$QG_LAUNCHD_LOCK_ROOT"; do
+  require_directory "$root" "DISK_MAINTENANCE_ROOT_MISSING"
+  assert_path_has_no_symlink_components "$root"
+done
+assert_path_has_no_symlink_components "$QG_DISK_MAINTENANCE_STATUS_FILE"
+assert_path_has_no_symlink_components "$QG_DISK_MAINTENANCE_LOCK_FILE"
+
+if ! backend_root_real="$(canonical_directory "$QG_BACKEND_ROOT")" || \
+   ! backend_runtime_real="$(canonical_directory "$backend_runtime")" || \
+   ! mt5_terminal_real="$(canonical_directory "$QG_MT5_ROOT")" || \
+   ! runtime_real="$(canonical_directory "$QG_RUNTIME_DIR")" || \
+   ! mt5_files_real="$(canonical_directory "$QG_MT5_FILES_DIR")" || \
+   ! private_real="$(canonical_directory "$QG_PRIVATE_ROOT")" || \
+   ! status_root_real="$(canonical_directory "$QG_LAUNCHD_STATUS_ROOT")" || \
+   ! lock_root_real="$(canonical_directory "$QG_LAUNCHD_LOCK_ROOT")"; then
+  block_service "DISK_MAINTENANCE_PATH_RESOLVE_FAILED" "disk maintenance roots could not be canonicalized"
+fi
+
+[[ "$backend_runtime_real" == "$backend_root_real/runtime" ]] || \
+  block_service "DISK_BACKEND_RUNTIME_BOUNDARY_FAILED" "Backend runtime root escaped the Backend repository"
+[[ "$runtime_real" == "$mt5_files_real" ]] || \
+  block_service "DISK_MT5_RUNTIME_BOUNDARY_FAILED" "QG_RUNTIME_DIR must match QG_MT5_FILES_DIR"
+[[ "$mt5_files_real" == "$mt5_terminal_real/MQL5/Files" ]] || \
+  block_service "DISK_MT5_FILES_BOUNDARY_FAILED" "MT5 Files root escaped the reviewed terminal root"
+[[ "$status_root_real" == "$private_real/status" ]] || \
+  block_service "DISK_STATUS_BOUNDARY_FAILED" "status root escaped the QuantGod private root"
+[[ "$lock_root_real" == "$private_real/locks" ]] || \
+  block_service "DISK_LOCK_BOUNDARY_FAILED" "lock root escaped the QuantGod private root"
+expected_status_file="$status_root_real/QuantGod_DiskSpaceMaintenanceStatus.json"
+expected_lock_file="$lock_root_real/disk-space-maintenance.lock"
+[[ "$QG_DISK_MAINTENANCE_STATUS_FILE" == "$expected_status_file" ]] || \
+  block_service "DISK_STATUS_FILE_BOUNDARY_FAILED" "disk maintenance status file must use the exact private status path"
+[[ "$QG_DISK_MAINTENANCE_LOCK_FILE" == "$expected_lock_file" ]] || \
+  block_service "DISK_LOCK_FILE_BOUNDARY_FAILED" "disk maintenance lock file must use the exact private lock path"
+for root in \
+  "$backend_root_real" \
+  "$backend_runtime_real" \
+  "$mt5_terminal_real" \
+  "$runtime_real" \
+  "$private_real" \
+  "$status_root_real" \
+  "$lock_root_real"; do
+  [[ "$root" != "/" ]] || \
+    block_service "DISK_MAINTENANCE_ROOT_FORBIDDEN" "filesystem root cannot be maintained"
+done
+[[ "$backend_root_real" != "$mt5_terminal_real" && \
+   "$backend_root_real" != "$private_real" && \
+   "$mt5_terminal_real" != "$private_real" && \
+   "$backend_runtime_real" != "$runtime_real" ]] || \
+  block_service "DISK_MAINTENANCE_ROOT_COLLISION" "disk maintenance roots must remain distinct"
+
+for key_code in \
+  "QG_DISK_WARN_FREE_PERCENT:DISK_WARN_PERCENT_INVALID" \
+  "QG_DISK_CRITICAL_FREE_PERCENT:DISK_CRITICAL_PERCENT_INVALID" \
+  "QG_DISK_TARGET_FREE_PERCENT:DISK_TARGET_PERCENT_INVALID" \
+  "QG_DISK_HISTORY_RETENTION_DAYS:DISK_HISTORY_RETENTION_INVALID" \
+  "QG_DISK_PRESSURE_RETENTION_DAYS:DISK_PRESSURE_RETENTION_INVALID" \
+  "QG_DISK_HISTORY_KEEP:DISK_HISTORY_KEEP_INVALID" \
+  "QG_DISK_PRESSURE_HISTORY_KEEP:DISK_PRESSURE_HISTORY_KEEP_INVALID" \
+  "QG_DISK_STALE_TEMP_HOURS:DISK_STALE_TEMP_HOURS_INVALID" \
+  "QG_DISK_MAX_DELETE_MB_PER_RUN:DISK_DELETE_BUDGET_INVALID" \
+  "QG_DISK_MAX_DELETE_FILES_PER_RUN:DISK_DELETE_FILE_BUDGET_INVALID" \
+  "QG_DISK_MAINTENANCE_FRESH_SECONDS:DISK_REPORT_FRESHNESS_INVALID"; do
+  require_positive_integer_env "${key_code%%:*}" "${key_code#*:}"
+done
+if ! "$QG_PYTHON_BIN" - \
+  "$QG_DISK_WARN_FREE_PERCENT" \
+  "$QG_DISK_CRITICAL_FREE_PERCENT" \
+  "$QG_DISK_TARGET_FREE_PERCENT" <<'PY'
+import sys
+
+warning, critical, target = map(int, sys.argv[1:])
+raise SystemExit(0 if 0 < critical < target <= warning < 100 else 1)
+PY
+then
+  block_service "DISK_THRESHOLD_ORDER_INVALID" "disk thresholds must satisfy 0 < critical < target <= warning < 100"
+fi
+
+run_started_epoch="$("$QG_PYTHON_BIN" - <<'PY'
+import time
+
+print(f"{time.time():.6f}")
+PY
+)"
+mark_service "RUNNING" "DISK_MAINTENANCE_START" "running bounded QuantGod-only disk maintenance"
+"$QG_PYTHON_BIN" "$QG_BACKEND_ROOT/tools/maintain_disk_space.py" \
+  --backend-runtime-root "$backend_runtime_real" \
+  --mt5-runtime-root "$runtime_real" \
+  --status-root "$status_root_real" \
+  --lock-root "$lock_root_real" \
+  --backend-root "$backend_root_real" \
+  --mt5-terminal-root "$mt5_terminal_real" \
+  --private-root "$private_real" \
+  --status-file "$QG_DISK_MAINTENANCE_STATUS_FILE" \
+  --lock-file "$QG_DISK_MAINTENANCE_LOCK_FILE" \
+  --warn-free-percent "$QG_DISK_WARN_FREE_PERCENT" \
+  --critical-free-percent "$QG_DISK_CRITICAL_FREE_PERCENT" \
+  --target-free-percent "$QG_DISK_TARGET_FREE_PERCENT" \
+  --history-retention-days "$QG_DISK_HISTORY_RETENTION_DAYS" \
+  --pressure-retention-days "$QG_DISK_PRESSURE_RETENTION_DAYS" \
+  --history-keep "$QG_DISK_HISTORY_KEEP" \
+  --pressure-history-keep "$QG_DISK_PRESSURE_HISTORY_KEEP" \
+  --stale-temp-hours "$QG_DISK_STALE_TEMP_HOURS" \
+  --max-delete-mb-per-run "$QG_DISK_MAX_DELETE_MB_PER_RUN" \
+  --max-delete-files-per-run "$QG_DISK_MAX_DELETE_FILES_PER_RUN" \
+  --execute > /dev/null
+
+validation="$("$QG_PYTHON_BIN" - \
+  "$QG_DISK_MAINTENANCE_STATUS_FILE" \
+  "$run_started_epoch" \
+  "$QG_DISK_MAINTENANCE_FRESH_SECONDS" \
+  "$backend_root_real" \
+  "$backend_runtime_real" \
+  "$mt5_terminal_real" \
+  "$runtime_real" \
+  "$private_real" \
+  "$status_root_real" \
+  "$lock_root_real" \
+  "$QG_DISK_MAINTENANCE_LOCK_FILE" \
+  "$QG_DISK_WARN_FREE_PERCENT" \
+  "$QG_DISK_CRITICAL_FREE_PERCENT" \
+  "$QG_DISK_TARGET_FREE_PERCENT" \
+  "$QG_DISK_HISTORY_RETENTION_DAYS" \
+  "$QG_DISK_PRESSURE_RETENTION_DAYS" \
+  "$QG_DISK_HISTORY_KEEP" \
+  "$QG_DISK_PRESSURE_HISTORY_KEEP" \
+  "$QG_DISK_STALE_TEMP_HOURS" \
+  "$QG_DISK_MAX_DELETE_MB_PER_RUN" \
+  "$QG_DISK_MAX_DELETE_FILES_PER_RUN" <<'PY'
+from datetime import datetime
+import json
+import math
+from pathlib import Path
+import re
+import sys
+import time
+
+(
+    report_raw,
+    run_started_raw,
+    fresh_seconds_raw,
+    backend_root_raw,
+    backend_runtime_raw,
+    mt5_terminal_raw,
+    mt5_runtime_raw,
+    private_root_raw,
+    status_root_raw,
+    lock_root_raw,
+    lock_file_raw,
+    warning_raw,
+    critical_raw,
+    target_raw,
+    history_retention_raw,
+    pressure_retention_raw,
+    history_keep_raw,
+    pressure_history_keep_raw,
+    stale_temp_raw,
+    max_delete_mb_raw,
+    max_delete_files_raw,
+) = sys.argv[1:]
+
+report_path = Path(report_raw)
+if report_path.is_symlink() or not report_path.is_file():
+    raise SystemExit("disk maintenance report is unavailable or symlinked")
+try:
+    run_started = float(run_started_raw)
+    fresh_seconds = int(fresh_seconds_raw)
+except (TypeError, ValueError):
+    raise SystemExit("disk maintenance report freshness inputs are invalid")
+now = time.time()
+clock_skew_seconds = 5.0
+if (
+    not math.isfinite(run_started)
+    or run_started <= 0
+    or fresh_seconds <= 0
+    or run_started < now - fresh_seconds
+    or run_started > now + clock_skew_seconds
+):
+    raise SystemExit("disk maintenance report validation window is invalid")
+report_mtime = report_path.stat().st_mtime
+if report_mtime < run_started - clock_skew_seconds or report_mtime < now - fresh_seconds:
+    raise SystemExit("disk maintenance report file predates this run")
+if report_mtime > now + clock_skew_seconds:
+    raise SystemExit("disk maintenance report file mtime is from the future")
+payload = json.loads(report_path.read_text(encoding="utf-8"))
+generated_raw = payload.get("generatedAtIso")
+if not isinstance(generated_raw, str) or not generated_raw.strip():
+    raise SystemExit("disk maintenance generatedAtIso is invalid")
+generated_normalized = generated_raw.strip()
+if generated_normalized.endswith("Z"):
+    generated_normalized = generated_normalized[:-1] + "+00:00"
+try:
+    generated_at = datetime.fromisoformat(generated_normalized)
+    if generated_at.tzinfo is None or generated_at.utcoffset() is None:
+        raise ValueError("timezone is required")
+    generated_epoch = generated_at.timestamp()
+except (OverflowError, TypeError, ValueError):
+    raise SystemExit("disk maintenance generatedAtIso is invalid")
+if (
+    not math.isfinite(generated_epoch)
+    or generated_epoch < run_started - clock_skew_seconds
+    or generated_epoch < now - fresh_seconds
+):
+    raise SystemExit("disk maintenance generatedAtIso predates this run")
+if generated_epoch > now + clock_skew_seconds:
+    raise SystemExit("disk maintenance generatedAtIso is from the future")
+if payload.get("schema") != "quantgod.disk_space_maintenance.v1":
+    raise SystemExit("disk maintenance returned an unexpected schema")
+if payload.get("status") not in {"SUCCESS", "PRESSURE_REMAINS"}:
+    raise SystemExit("disk maintenance did not confirm a successful task status")
+if payload.get("mode") != "EXECUTE" or payload.get("dryRun") is not False:
+    raise SystemExit("disk maintenance did not confirm execute mode")
+
+expected_paths = {
+    "backendRoot": Path(backend_root_raw).resolve(),
+    "backendRuntimeRoot": Path(backend_runtime_raw).resolve(),
+    "mt5TerminalRoot": Path(mt5_terminal_raw).resolve(),
+    "mt5RuntimeRoot": Path(mt5_runtime_raw).resolve(),
+    "privateRoot": Path(private_root_raw).resolve(),
+    "statusRoot": Path(status_root_raw).resolve(),
+    "lockRoot": Path(lock_root_raw).resolve(),
+    "statusFile": report_path.resolve(),
+    "lockFile": Path(lock_file_raw).resolve(),
+}
+validated = payload.get("validatedRoots")
+if not isinstance(validated, dict):
+    raise SystemExit("disk maintenance validatedRoots contract is missing")
+for key, expected in expected_paths.items():
+    actual = Path(str(validated.get(key) or "")).expanduser()
+    if not actual.is_absolute() or actual.resolve() != expected:
+        raise SystemExit(f"disk maintenance validated root mismatch: {key}")
+
+expected_allowed = [
+    expected_paths["backendRuntimeRoot"],
+    expected_paths["mt5RuntimeRoot"],
+    expected_paths["statusRoot"],
+    expected_paths["lockRoot"],
+]
+allowed = payload.get("allowedRoots")
+if not isinstance(allowed, list) or len(allowed) != len(expected_allowed):
+    raise SystemExit("disk maintenance allowedRoots contract is incomplete")
+resolved_allowed = []
+for raw in allowed:
+    candidate = Path(str(raw)).expanduser()
+    if not candidate.is_absolute():
+        raise SystemExit("disk maintenance allowed root is not absolute")
+    resolved_allowed.append(candidate.resolve())
+if resolved_allowed != expected_allowed or len(set(resolved_allowed)) != len(resolved_allowed):
+    raise SystemExit("disk maintenance allowedRoots do not match the reviewed roots")
+
+safety = payload.get("safety") if isinstance(payload.get("safety"), dict) else {}
+for key in (
+    "userDataDeletionAllowed",
+    "mt5MutationAllowed",
+    "orderSendAllowed",
+    "closeAllowed",
+    "cancelAllowed",
+    "livePresetMutationAllowed",
+    "mt5OrderFilesTouched",
+    "databaseFilesTouched",
+    "sourceConfigOrEx5Touched",
+):
+    if safety.get(key) is not False:
+        raise SystemExit(f"disk maintenance safety contract missing {key}=false")
+if safety.get("localOnly") is not True or safety.get("managedArtifactDeletionAllowed") is not True:
+    raise SystemExit("disk maintenance safety contract is incomplete")
+
+thresholds = payload.get("thresholds") if isinstance(payload.get("thresholds"), dict) else {}
+expected_thresholds = {
+    "warningFreePercent": float(warning_raw),
+    "criticalFreePercent": float(critical_raw),
+    "targetFreePercent": float(target_raw),
+}
+if thresholds != expected_thresholds:
+    raise SystemExit("disk maintenance threshold contract drifted")
+policy = payload.get("policy") if isinstance(payload.get("policy"), dict) else {}
+if policy.get("staleTempHours") != int(stale_temp_raw):
+    raise SystemExit("disk maintenance stale-temp policy drifted")
+max_delete_bytes = int(max_delete_mb_raw) * 1024 * 1024
+if policy.get("maxDeleteBytesPerRun") != max_delete_bytes:
+    raise SystemExit("disk maintenance deletion budget drifted")
+if policy.get("maxDeleteFilesPerRun") != int(max_delete_files_raw):
+    raise SystemExit("disk maintenance deletion file budget drifted")
+
+errors = payload.get("errors")
+summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+error_count = summary.get("errorCount")
+if errors != [] or type(error_count) is not int or error_count != 0:
+    raise SystemExit("disk maintenance reported deletion errors")
+deleted = payload.get("deleted")
+if not isinstance(deleted, list):
+    raise SystemExit("disk maintenance deleted contract is invalid")
+deleted_count = summary.get("deletedCount")
+if (
+    type(deleted_count) is not int
+    or len(deleted) > int(max_delete_files_raw)
+    or deleted_count != len(deleted)
+):
+    raise SystemExit("disk maintenance exceeded its deletion file budget")
+deleted_bytes = summary.get("deletedBytes")
+if type(deleted_bytes) is not int or deleted_bytes < 0 or deleted_bytes > max_delete_bytes:
+    raise SystemExit("disk maintenance exceeded its deletion budget")
+
+protected_suffixes = {
+    ".sqlite", ".sqlite3", ".db", ".wal", ".shm", ".mq5", ".mqh",
+    ".ex5", ".ini", ".set", ".conf", ".yaml", ".yml", ".toml",
+}
+deletion_contracts = {
+    "backend_ai_analysis_history": (
+        expected_paths["backendRuntimeRoot"] / "ai_analysis" / "history",
+        re.compile(r"^\d{8}T\d{6}Z_[A-Za-z0-9_.-]+\.json$"),
+    ),
+    "mt5_ai_analysis_history": (
+        expected_paths["mt5RuntimeRoot"] / "ai_analysis" / "history",
+        re.compile(r"^\d{8}T\d{6}Z_[A-Za-z0-9_.-]+\.json$"),
+    ),
+    "status_stale_temp": (
+        expected_paths["statusRoot"],
+        re.compile(
+            r"^\.(?:history-sync|history-quality|automation-chain-report|"
+            r"agent-ops-health|endpoint-health|sqlite-backup|sqlite-backup-verify)"
+            r"\.tmp-[1-9]\d*$"
+        ),
+    ),
+}
+summed_deleted_bytes = 0
+for row in deleted:
+    if not isinstance(row, dict):
+        raise SystemExit("disk maintenance deleted row is invalid")
+    category = row.get("category")
+    if category not in deletion_contracts:
+        raise SystemExit("disk maintenance deleted category is not allow-listed")
+    candidate = Path(str(row.get("path") or "")).expanduser()
+    if not candidate.is_absolute():
+        raise SystemExit("disk maintenance deleted path is not absolute")
+    resolved = candidate.resolve()
+    inside = False
+    for root in resolved_allowed:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        if resolved != root:
+            inside = True
+            break
+    if not inside:
+        raise SystemExit("disk maintenance deleted outside its allowed roots")
+    expected_parent, filename_matcher = deletion_contracts[category]
+    if resolved.parent != expected_parent.resolve() or not filename_matcher.fullmatch(resolved.name):
+        raise SystemExit("disk maintenance deleted path does not match its category contract")
+    if row.get("isDirectory") is not False:
+        raise SystemExit("disk maintenance must not delete directories")
+    size_bytes = row.get("sizeBytes")
+    if type(size_bytes) is not int or size_bytes < 0:
+        raise SystemExit("disk maintenance deleted sizeBytes is invalid")
+    summed_deleted_bytes += size_bytes
+    if resolved.name.lower().startswith("latest") and resolved.suffix.lower() == ".json":
+        raise SystemExit("disk maintenance deleted protected latest evidence")
+    if {suffix.lower() for suffix in resolved.suffixes} & protected_suffixes:
+        raise SystemExit("disk maintenance deleted a protected artifact type")
+if summed_deleted_bytes != deleted_bytes:
+    raise SystemExit("disk maintenance deleted byte accounting is inconsistent")
+
+valid_pressure_levels = {"NORMAL", "WARNING", "CRITICAL"}
+applied_pressure_level = payload.get("appliedPressureLevel")
+if applied_pressure_level not in valid_pressure_levels:
+    raise SystemExit("disk maintenance applied pressure contract is invalid")
+
+pressure_active = payload.get("pressureActive")
+pressure_level = payload.get("pressureLevel")
+if not isinstance(pressure_active, bool) or pressure_level not in valid_pressure_levels:
+    raise SystemExit("disk maintenance pressure contract is invalid")
+if (pressure_level == "CRITICAL") != pressure_active:
+    raise SystemExit("disk maintenance critical pressure level and pressureActive disagree")
+if (payload.get("status") == "PRESSURE_REMAINS") != pressure_active:
+    raise SystemExit("disk maintenance status and pressureActive disagree")
+if applied_pressure_level == "CRITICAL":
+    expected_effective_policy = {
+        "retentionDays": int(pressure_retention_raw),
+        "historyKeep": int(pressure_history_keep_raw),
+    }
+else:
+    expected_effective_policy = {
+        "retentionDays": int(history_retention_raw),
+        "historyKeep": int(history_keep_raw),
+    }
+for key, expected in expected_effective_policy.items():
+    if type(policy.get(key)) is not int or policy.get(key) != expected:
+        raise SystemExit(f"disk maintenance effective retention policy drifted: {key}")
+disk = payload.get("disk") if isinstance(payload.get("disk"), dict) else {}
+after = disk.get("after") if isinstance(disk.get("after"), dict) else {}
+free_percent = after.get("freePercent")
+if (
+    isinstance(free_percent, bool)
+    or not isinstance(free_percent, (int, float))
+    or not math.isfinite(float(free_percent))
+    or not 0.0 <= float(free_percent) <= 100.0
+):
+    raise SystemExit("disk maintenance after free-space evidence is missing")
+free_percent_value = float(free_percent)
+warning_threshold = float(warning_raw)
+critical_threshold = float(critical_raw)
+target_threshold = float(target_raw)
+if pressure_level == "CRITICAL" and not 0.0 <= free_percent_value < target_threshold:
+    raise SystemExit("disk maintenance critical pressure level disagrees with free space")
+if pressure_level == "WARNING" and not critical_threshold <= free_percent_value < warning_threshold:
+    raise SystemExit("disk maintenance warning pressure level disagrees with free space")
+if pressure_level == "NORMAL" and not warning_threshold <= free_percent_value <= 100.0:
+    raise SystemExit("disk maintenance normal pressure level disagrees with free space")
+
+if pressure_active:
+    observed = "BLOCKED"
+    code = "DISK_MAINTENANCE_PRESSURE_REMAINS"
+elif pressure_level == "WARNING":
+    observed = "WARN"
+    code = "DISK_MAINTENANCE_WARNING"
+else:
+    observed = "PASS"
+    code = "DISK_MAINTENANCE_COMPLETE"
+detail = (
+    f"pressureLevel={pressure_level} freePercent={free_percent_value:.2f} "
+    f"deletedCount={len(deleted)} deletedBytes={deleted_bytes}"
+)
+print(observed)
+print(code)
+print(detail)
+PY
+)"
+observed_status="$(printf '%s\n' "$validation" | sed -n '1p')"
+completion_code="$(printf '%s\n' "$validation" | sed -n '2p')"
+completion_detail="$(printf '%s\n' "$validation" | sed -n '3p')"
+finish_service_observed "PASS" "$completion_code" "$completion_detail" "$observed_status"
 ''',
         "quantgod-sqlite-backup.sh": wrapper_header("sqlite-backup")
         + r'''

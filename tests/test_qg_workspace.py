@@ -241,6 +241,42 @@ class WorkspaceHelperTest(unittest.TestCase):
             self.assertEqual((backups[0] / "index.html").read_text(encoding="utf-8"), "old frontend")
             self.assertEqual(list((backend / "Dashboard").glob(".vue-dist.staging-*")), [])
 
+    def test_sync_frontend_dist_keeps_only_the_immediately_previous_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            backend = root / "QuantGodBackend"
+            frontend = root / "QuantGodFrontend"
+            infra = root / "QuantGodInfra"
+            docs = root / "QuantGodDocs"
+            frontend_dist = frontend / "dist"
+            backend_dist = backend / "Dashboard" / "vue-dist"
+            frontend_dist.mkdir(parents=True)
+            backend_dist.mkdir(parents=True)
+            infra.mkdir()
+            docs.mkdir()
+            (backend_dist / "index.html").write_text("frontend-v0", encoding="utf-8")
+            ws = {
+                "backend": str(backend),
+                "frontend": str(frontend),
+                "infra": str(infra),
+                "docs": str(docs),
+            }
+
+            for version in ("frontend-v1", "frontend-v2", "frontend-v3"):
+                (frontend_dist / "index.html").write_text(version, encoding="utf-8")
+                qgw.cmd_sync_frontend_dist(ws)
+
+            backups = list((backend / "Dashboard").glob("vue-dist.previous-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(
+                (backups[0] / "index.html").read_text(encoding="utf-8"),
+                "frontend-v2",
+            )
+            self.assertEqual(
+                (backend_dist / "index.html").read_text(encoding="utf-8"),
+                "frontend-v3",
+            )
+
     def test_sync_frontend_dist_restores_current_when_atomic_promotion_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -263,6 +299,9 @@ class WorkspaceHelperTest(unittest.TestCase):
                 "docs": str(docs),
             }
             original_rename = qgw._rename_path
+            prior_backup = backend_dist.parent / ("vue-dist.previous-" + "a" * 32)
+            prior_backup.mkdir()
+            (prior_backup / "index.html").write_text("older frontend", encoding="utf-8")
 
             def fail_staging_promotion(source: pathlib.Path, destination: pathlib.Path) -> None:
                 if source.name.startswith(".vue-dist.staging-"):
@@ -275,6 +314,7 @@ class WorkspaceHelperTest(unittest.TestCase):
 
             self.assertEqual((backend_dist / "index.html").read_text(encoding="utf-8"), "old frontend")
             self.assertEqual(list((backend / "Dashboard").glob(".vue-dist.staging-*")), [])
+            self.assertTrue(prior_backup.is_dir())
 
     def test_sync_frontend_dist_rejects_paths_outside_repositories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

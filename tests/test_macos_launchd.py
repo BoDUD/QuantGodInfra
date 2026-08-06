@@ -251,7 +251,36 @@ class MacLaunchdHelperTests(unittest.TestCase):
             self.assertIn("QG_LEGACY_DAILY_AUTOPILOT_ENABLED='0'", text)
             self.assertIn("QG_AGENT_V25_INTERVAL_SECONDS='300'", text)
             self.assertIn("QG_AGENT_V25_SEND_TELEGRAM='0'", text)
+            self.assertIn("QG_DISK_WARN_FREE_PERCENT='20'", text)
+            self.assertIn("QG_DISK_CRITICAL_FREE_PERCENT='10'", text)
+            self.assertIn("QG_DISK_TARGET_FREE_PERCENT='12'", text)
+            self.assertIn("QG_DISK_HISTORY_RETENTION_DAYS='14'", text)
+            self.assertIn("QG_DISK_PRESSURE_RETENTION_DAYS='3'", text)
+            self.assertIn("QG_DISK_HISTORY_KEEP='500'", text)
+            self.assertIn("QG_DISK_PRESSURE_HISTORY_KEEP='100'", text)
+            self.assertNotIn("QG_DISK_ARCHIVE_KEEP", text)
+            self.assertIn("QG_DISK_STALE_TEMP_HOURS='24'", text)
+            self.assertIn("QG_DISK_MAX_DELETE_MB_PER_RUN='2048'", text)
+            self.assertIn("QG_DISK_MAX_DELETE_FILES_PER_RUN='500'", text)
+            self.assertIn("QG_DISK_MAINTENANCE_FRESH_SECONDS='7200'", text)
+            self.assertIn(
+                "QG_DISK_MAINTENANCE_STATUS_FILE="
+                + launchd.quote_shell(
+                    str(launchd.STATUS_DIR / "QuantGod_DiskSpaceMaintenanceStatus.json")
+                ),
+                text,
+            )
+            self.assertIn(
+                "QG_DISK_MAINTENANCE_LOCK_FILE="
+                + launchd.quote_shell(
+                    str(launchd.LOCK_DIR / "disk-space-maintenance.lock")
+                ),
+                text,
+            )
             self.assertIn("QG_SQLITE_BACKUP_KEEP='3'", text)
+            self.assertIn("QG_RUNTIME_LOG_MAX_MB='32'", text)
+            self.assertIn("QG_RUNTIME_LOG_ARCHIVE_MAX_MB='512'", text)
+            self.assertIn("QG_RUNTIME_JSONL_ARCHIVE_MAX_MB='512'", text)
             self.assertIn("QG_AGENT_V25_HEAVY_TELEGRAM_GATEWAY='0'", text)
             self.assertIn("QG_AGENT_OPS_HEALTH_ENABLED='1'", text)
             self.assertIn("QG_PRODUCTION_BURN_IN_ENABLED='1'", text)
@@ -376,6 +405,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
                 "automation-chain",
                 "health-maintenance",
                 "log-maintenance",
+                "disk-maintenance",
                 "sqlite-backup",
             ),
         )
@@ -395,6 +425,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
                 "automation-chain",
                 "health-maintenance",
                 "log-maintenance",
+                "disk-maintenance",
                 "sqlite-backup",
             ),
         )
@@ -413,6 +444,7 @@ class MacLaunchdHelperTests(unittest.TestCase):
             "QG_MT5_SECONDARY_SHADOW_PRESET_SOURCE='b/MQL5/Presets/QuantGod_MT5_HFM_LiveSecondary.set'",
             dual_env,
         )
+        self.assertIn("disk-maintenance", launchd.SERVICE_PROFILES["research"])
 
     def test_install_rolls_back_services_loaded_before_bootstrap_failure(self) -> None:
         args = launchd.build_parser().parse_args(["install", "--profile", "core"])
@@ -498,12 +530,15 @@ class MacLaunchdHelperTests(unittest.TestCase):
             self.assertEqual(launchd.install(args), 0)
 
         backend_event = f"bootstrap:{launchd.SERVICES['backend-api']['label']}"
+        disk_event = f"bootstrap:{launchd.SERVICES['disk-maintenance']['label']}"
         self.assertLess(events.index("build"), events.index("bootout"))
         self.assertLess(events.index("bootout"), events.index("stage"))
         self.assertLess(events.index("stage"), events.index("publish-dist"))
         self.assertLess(events.index("publish-dist"), events.index("publish"))
         self.assertLess(events.index("publish"), events.index(backend_event))
         self.assertGreater(events.index("discard"), events.index(backend_event))
+        self.assertIn(disk_event, events)
+        self.assertLess(events.index("publish"), events.index(disk_event))
         self.assertFalse(any("frontend-dist-build" in event for event in events if event.startswith("bootstrap:")))
         self.assertEqual(
             write_files.call_args.kwargs["selected_launch_agent_labels"],
@@ -839,6 +874,381 @@ class MacLaunchdHelperTests(unittest.TestCase):
         self.assertEqual(wrapper.count('--retention-days "$QG_RUNTIME_LOG_RETENTION_DAYS"'), 2)
         self.assertEqual(wrapper.count('--max-jsonl-mb "$QG_RUNTIME_JSONL_MAX_MB"'), 1)
         self.assertEqual(wrapper.count("--no-jsonl-maintenance"), 1)
+
+    def test_disk_maintenance_wrapper_is_bounded_validated_and_pressure_aware(self) -> None:
+        wrapper = launchd.render_wrappers()["quantgod-disk-maintenance.sh"]
+        self.assertIn("tools/maintain_disk_space.py", wrapper)
+        self.assertIn('backend_runtime="$QG_BACKEND_ROOT/runtime"', wrapper)
+        self.assertIn('[[ "$backend_runtime_real" == "$backend_root_real/runtime" ]]', wrapper)
+        self.assertIn('[[ "$runtime_real" == "$mt5_files_real" ]]', wrapper)
+        self.assertIn('[[ "$mt5_files_real" == "$mt5_terminal_real/MQL5/Files" ]]', wrapper)
+        self.assertIn('[[ "$status_root_real" == "$private_real/status" ]]', wrapper)
+        self.assertIn('[[ "$lock_root_real" == "$private_real/locks" ]]', wrapper)
+        self.assertIn("DISK_MAINTENANCE_ROOT_COLLISION", wrapper)
+        self.assertIn("assert_path_has_no_symlink_components", wrapper)
+        for argument in (
+            "--backend-runtime-root",
+            "--mt5-runtime-root",
+            "--status-root",
+            "--lock-root",
+            "--backend-root",
+            "--mt5-terminal-root",
+            "--private-root",
+            "--status-file",
+            "--lock-file",
+            "--warn-free-percent",
+            "--critical-free-percent",
+            "--target-free-percent",
+            "--history-retention-days",
+            "--pressure-retention-days",
+            "--history-keep",
+            "--pressure-history-keep",
+            "--stale-temp-hours",
+            "--max-delete-mb-per-run",
+            "--max-delete-files-per-run",
+            "--execute",
+        ):
+            self.assertIn(argument, wrapper)
+        self.assertNotIn("--archive-keep", wrapper)
+        for marker in (
+            "quantgod.disk_space_maintenance.v1",
+            "validatedRoots",
+            "allowedRoots",
+            "disk maintenance deleted outside its allowed roots",
+            "userDataDeletionAllowed",
+            "mt5MutationAllowed",
+            "orderSendAllowed",
+            "databaseFilesTouched",
+            "sourceConfigOrEx5Touched",
+            "maxDeleteBytesPerRun",
+            "maxDeleteFilesPerRun",
+            "generatedAtIso",
+            "appliedPressureLevel",
+            "QG_DISK_MAINTENANCE_FRESH_SECONDS",
+            "run_started_epoch",
+            "backend_ai_analysis_history",
+            "mt5_ai_analysis_history",
+            "status_stale_temp",
+            "PRESSURE_REMAINS",
+            "DISK_MAINTENANCE_PRESSURE_REMAINS",
+            "finish_service_observed",
+        ):
+            self.assertIn(marker, wrapper)
+        for removed_category in (
+            "backend_log_archive",
+            "mt5_log_archive",
+            "backend_jsonl_archive",
+            "mt5_jsonl_archive",
+        ):
+            self.assertNotIn(removed_category, wrapper)
+        self.assertNotIn("rm -rf", wrapper)
+        self.assertNotIn("Library/Caches", wrapper)
+        self.assertNotIn("/.Trash", wrapper)
+        self.assertNotIn("/Downloads", wrapper)
+
+    def test_disk_report_validator_accepts_pressure_and_rejects_category_or_root_escape(self) -> None:
+        wrapper = launchd.render_wrappers()["quantgod-disk-maintenance.sh"]
+        validators = [
+            block
+            for block in re.findall(r"<<'PY'\n(.*?)\nPY", wrapper, flags=re.DOTALL)
+            if "disk maintenance returned an unexpected schema" in block
+        ]
+        self.assertEqual(len(validators), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp).resolve()
+            backend = root / "backend"
+            backend_runtime = backend / "runtime"
+            mt5_terminal = root / "mt5-terminal"
+            mt5_runtime = mt5_terminal / "MQL5" / "Files"
+            private = root / "private"
+            status_root = private / "status"
+            lock_root = private / "locks"
+            for directory in (backend_runtime, mt5_runtime, status_root, lock_root):
+                directory.mkdir(parents=True)
+            backend_history = backend_runtime / "ai_analysis" / "history"
+            backend_history.mkdir(parents=True)
+            report = status_root / "QuantGod_DiskSpaceMaintenanceStatus.json"
+            lock_file = lock_root / "disk-space-maintenance.lock"
+            deleted_history = backend_history / "20260701T000000Z_USDJPYc_v2.json"
+            allowed_roots = [backend_runtime, mt5_runtime, status_root, lock_root]
+            run_started_epoch = time.time()
+            generated_at_iso = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ",
+                time.gmtime(run_started_epoch),
+            )
+            payload = {
+                "schema": "quantgod.disk_space_maintenance.v1",
+                "generatedAtIso": generated_at_iso,
+                "status": "SUCCESS",
+                "mode": "EXECUTE",
+                "dryRun": False,
+                "pressureActive": False,
+                "appliedPressureLevel": "CRITICAL",
+                "pressureLevel": "WARNING",
+                "thresholds": {
+                    "warningFreePercent": 20.0,
+                    "criticalFreePercent": 10.0,
+                    "targetFreePercent": 12.0,
+                },
+                "policy": {
+                    "retentionDays": 3,
+                    "historyKeep": 100,
+                    "staleTempHours": 24,
+                    "maxDeleteBytesPerRun": 2048 * 1024 * 1024,
+                    "maxDeleteFilesPerRun": 500,
+                },
+                "disk": {"after": {"freePercent": 15.0}},
+                "allowedRoots": [str(path) for path in allowed_roots],
+                "validatedRoots": {
+                    "backendRoot": str(backend),
+                    "backendRuntimeRoot": str(backend_runtime),
+                    "mt5TerminalRoot": str(mt5_terminal),
+                    "mt5RuntimeRoot": str(mt5_runtime),
+                    "privateRoot": str(private),
+                    "statusRoot": str(status_root),
+                    "lockRoot": str(lock_root),
+                    "statusFile": str(report),
+                    "lockFile": str(lock_file),
+                },
+                "deleted": [
+                    {
+                        "path": str(deleted_history),
+                        "category": "backend_ai_analysis_history",
+                        "sizeBytes": 42,
+                        "isDirectory": False,
+                    }
+                ],
+                "errors": [],
+                "summary": {"deletedCount": 1, "deletedBytes": 42, "errorCount": 0},
+                "safety": {
+                    "localOnly": True,
+                    "userDataDeletionAllowed": False,
+                    "managedArtifactDeletionAllowed": True,
+                    "mt5MutationAllowed": False,
+                    "orderSendAllowed": False,
+                    "closeAllowed": False,
+                    "cancelAllowed": False,
+                    "livePresetMutationAllowed": False,
+                    "mt5OrderFilesTouched": False,
+                    "databaseFilesTouched": False,
+                    "sourceConfigOrEx5Touched": False,
+                },
+            }
+
+            def validate(*, report_mtime: float | None = None) -> subprocess.CompletedProcess[str]:
+                report.write_text(json.dumps(payload), encoding="utf-8")
+                if report_mtime is not None:
+                    os.utime(report, (report_mtime, report_mtime))
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-",
+                        str(report),
+                        str(run_started_epoch),
+                        "7200",
+                        str(backend),
+                        str(backend_runtime),
+                        str(mt5_terminal),
+                        str(mt5_runtime),
+                        str(private),
+                        str(status_root),
+                        str(lock_root),
+                        str(lock_file),
+                        "20",
+                        "10",
+                        "12",
+                        "14",
+                        "3",
+                        "500",
+                        "100",
+                        "24",
+                        "2048",
+                        "500",
+                    ],
+                    input=validators[0],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+
+            accepted = validate()
+            self.assertEqual(accepted.returncode, 0, msg=accepted.stderr)
+            self.assertEqual(
+                accepted.stdout.splitlines(),
+                [
+                    "WARN",
+                    "DISK_MAINTENANCE_WARNING",
+                    "pressureLevel=WARNING freePercent=15.00 deletedCount=1 deletedBytes=42",
+                ],
+            )
+
+            old_report = validate(report_mtime=run_started_epoch - 60)
+            self.assertNotEqual(old_report.returncode, 0)
+            self.assertIn("report file predates this run", old_report.stderr)
+
+            future_report = validate(report_mtime=time.time() + 60)
+            self.assertNotEqual(future_report.returncode, 0)
+            self.assertIn("report file mtime is from the future", future_report.stderr)
+
+            payload["generatedAtIso"] = "2000-01-01T00:00:00Z"
+            old_generated_at = validate()
+            self.assertNotEqual(old_generated_at.returncode, 0)
+            self.assertIn("generatedAtIso predates this run", old_generated_at.stderr)
+
+            payload["generatedAtIso"] = "not-a-timestamp"
+            invalid_generated_at = validate()
+            self.assertNotEqual(invalid_generated_at.returncode, 0)
+            self.assertIn("generatedAtIso is invalid", invalid_generated_at.stderr)
+
+            payload["generatedAtIso"] = "2999-01-01T00:00:00Z"
+            future_generated_at = validate()
+            self.assertNotEqual(future_generated_at.returncode, 0)
+            self.assertIn("generatedAtIso is from the future", future_generated_at.stderr)
+            payload["generatedAtIso"] = generated_at_iso
+
+            applied_pressure_level = payload.pop("appliedPressureLevel")
+            missing_applied_level = validate()
+            self.assertNotEqual(missing_applied_level.returncode, 0)
+            self.assertIn(
+                "applied pressure contract is invalid",
+                missing_applied_level.stderr,
+            )
+            payload["appliedPressureLevel"] = applied_pressure_level
+
+            payload["policy"]["historyKeep"] = 500
+            tampered_policy = validate()
+            self.assertNotEqual(tampered_policy.returncode, 0)
+            self.assertIn(
+                "effective retention policy drifted: historyKeep",
+                tampered_policy.stderr,
+            )
+            payload["policy"]["historyKeep"] = 100
+
+            payload["summary"]["errorCount"] = False
+            boolean_error_count = validate()
+            self.assertNotEqual(boolean_error_count.returncode, 0)
+            self.assertIn("reported deletion errors", boolean_error_count.stderr)
+            payload["summary"]["errorCount"] = 0
+
+            payload["summary"]["deletedCount"] = True
+            boolean_deleted_count = validate()
+            self.assertNotEqual(boolean_deleted_count.returncode, 0)
+            self.assertIn("deletion file budget", boolean_deleted_count.stderr)
+            payload["summary"]["deletedCount"] = 1
+
+            payload["summary"]["deletedBytes"] = True
+            boolean_deleted_bytes = validate()
+            self.assertNotEqual(boolean_deleted_bytes.returncode, 0)
+            self.assertIn("deletion budget", boolean_deleted_bytes.stderr)
+            payload["summary"]["deletedBytes"] = 42
+
+            payload["deleted"][0]["sizeBytes"] = True
+            boolean_row_size = validate()
+            self.assertNotEqual(boolean_row_size.returncode, 0)
+            self.assertIn("sizeBytes is invalid", boolean_row_size.stderr)
+            payload["deleted"][0]["sizeBytes"] = 42
+
+            payload["pressureActive"] = 1
+            numeric_pressure_active = validate()
+            self.assertNotEqual(numeric_pressure_active.returncode, 0)
+            self.assertIn("pressure contract is invalid", numeric_pressure_active.stderr)
+            payload["pressureActive"] = False
+
+            payload["pressureLevel"] = "CRITICAL"
+            payload["disk"]["after"]["freePercent"] = 9.5
+            critical_without_active = validate()
+            self.assertNotEqual(critical_without_active.returncode, 0)
+            self.assertIn(
+                "critical pressure level and pressureActive disagree",
+                critical_without_active.stderr,
+            )
+
+            payload["pressureLevel"] = "WARNING"
+            payload["disk"]["after"]["freePercent"] = 15.0
+            payload["status"] = "PRESSURE_REMAINS"
+            inconsistent_status = validate()
+            self.assertNotEqual(inconsistent_status.returncode, 0)
+            self.assertIn(
+                "status and pressureActive disagree",
+                inconsistent_status.stderr,
+            )
+
+            payload["status"] = "SUCCESS"
+            payload["disk"]["after"]["freePercent"] = 25.0
+            inconsistent_free_percent = validate()
+            self.assertNotEqual(inconsistent_free_percent.returncode, 0)
+            self.assertIn(
+                "warning pressure level disagrees with free space",
+                inconsistent_free_percent.stderr,
+            )
+
+            payload["disk"]["after"]["freePercent"] = True
+            boolean_free_percent = validate()
+            self.assertNotEqual(boolean_free_percent.returncode, 0)
+            self.assertIn("free-space evidence is missing", boolean_free_percent.stderr)
+
+            payload["status"] = "PRESSURE_REMAINS"
+            payload["pressureActive"] = True
+            payload["pressureLevel"] = "CRITICAL"
+            payload["disk"]["after"]["freePercent"] = 9.5
+            pressure_remains = validate()
+            self.assertEqual(pressure_remains.returncode, 0, msg=pressure_remains.stderr)
+            self.assertEqual(
+                pressure_remains.stdout.splitlines()[:2],
+                ["BLOCKED", "DISK_MAINTENANCE_PRESSURE_REMAINS"],
+            )
+
+            payload["status"] = "SUCCESS"
+            payload["pressureActive"] = False
+            payload["policy"].update(
+                retentionDays=14,
+                historyKeep=500,
+            )
+            for pressure_level, expected_health, expected_code, free_percent in (
+                ("WARNING", "WARN", "DISK_MAINTENANCE_WARNING", 15.0),
+                ("NORMAL", "PASS", "DISK_MAINTENANCE_COMPLETE", 25.0),
+            ):
+                payload["appliedPressureLevel"] = pressure_level
+                payload["pressureLevel"] = pressure_level
+                payload["disk"]["after"]["freePercent"] = free_percent
+                accepted_normal_policy = validate()
+                self.assertEqual(
+                    accepted_normal_policy.returncode,
+                    0,
+                    msg=accepted_normal_policy.stderr,
+                )
+                self.assertEqual(
+                    accepted_normal_policy.stdout.splitlines()[:2],
+                    [expected_health, expected_code],
+                )
+
+            for removed_archive_category in (
+                "backend_log_archive",
+                "mt5_log_archive",
+                "backend_jsonl_archive",
+                "mt5_jsonl_archive",
+            ):
+                payload["deleted"][0]["category"] = removed_archive_category
+                rejected_archive_lane = validate()
+                self.assertNotEqual(rejected_archive_lane.returncode, 0)
+                self.assertIn(
+                    "deleted category is not allow-listed",
+                    rejected_archive_lane.stderr,
+                )
+            payload["deleted"][0]["category"] = "backend_ai_analysis_history"
+
+            payload["deleted"][0]["path"] = str(
+                backend_runtime / "unexpected_history" / deleted_history.name
+            )
+            wrong_directory = validate()
+            self.assertNotEqual(wrong_directory.returncode, 0)
+            self.assertIn("category contract", wrong_directory.stderr)
+
+            escaped = root / "Downloads" / "unmanaged.json"
+            payload["deleted"][0]["path"] = str(escaped)
+            rejected = validate()
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("outside its allowed roots", rejected.stderr)
 
     def test_local_shadow_wrappers_are_singleton_and_fail_closed(self) -> None:
         wrappers = launchd.render_wrappers()
@@ -1624,6 +2034,27 @@ class MacLaunchdHelperTests(unittest.TestCase):
         self.assertEqual(capability["status"], "BLOCKED")
         self.assertEqual(capability["reasonCodes"], ["LEGACY_AGENT_FAILURE_CONTRACT_UNSAFE"])
 
+    def test_disk_maintenance_capability_requires_backend_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            backend = root / "QuantGodBackend"
+            paths = {
+                "backend": backend,
+                "frontend": root / "QuantGodFrontend",
+                "infra": root / "QuantGodInfra",
+                "docs": root / "QuantGodDocs",
+            }
+            blocked = launchd.service_capability("disk-maintenance", paths)
+            runner = backend / "tools" / "maintain_disk_space.py"
+            runner.parent.mkdir(parents=True)
+            runner.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            ready = launchd.service_capability("disk-maintenance", paths)
+
+        self.assertFalse(blocked["ready"])
+        self.assertEqual(blocked["reasonCodes"], ["DISK_MAINTENANCE_RUNNER_MISSING"])
+        self.assertTrue(ready["ready"])
+        self.assertEqual(ready["reasonCodes"], [])
+
     def test_no_load_never_changes_launchd_state(self) -> None:
         args = launchd.build_parser().parse_args(["install", "--profile", "local-shadow", "--no-load"])
         paths = {
@@ -1813,6 +2244,9 @@ class MacLaunchdHelperTests(unittest.TestCase):
         frontend_build = launchd.render_plist(launchd.SERVICES["frontend-dist-build"])
         self.assertNotIn("KeepAlive", frontend_build)
         self.assertNotIn("StartInterval", frontend_build)
+        disk_maintenance = launchd.render_plist(launchd.SERVICES["disk-maintenance"])
+        self.assertEqual(disk_maintenance["StartInterval"], 3600)
+        self.assertIs(disk_maintenance["RunAtLoad"], True)
 
     def test_mt5_plist_and_capability_block_invalid_user_environment(self) -> None:
         with mock.patch.object(

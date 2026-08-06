@@ -114,7 +114,8 @@ supervisors have been stopped during a real transactional install.
 load the Vite development server, Daily Autopilot, Telegram, or DeepSeek. It
 adds the strict MT5 Shadow supervisor, direct fail-closed history sync,
 advisory-only automation chain, health refresh, independent log maintenance,
-and verified local SQLite backup. The MT5 wrapper accepts only
+bounded QuantGod-only disk maintenance, and verified local SQLite backup. The
+MT5 wrapper accepts only
 `QuantGod_MT5_HFM_Shadow_mac.ini` plus `QuantGod_MT5_HFM_Shadow.set`, verifies
 the config contains exactly one `Server=HFMarketsGlobal-Live12`, verifies
 `AllowLiveTrading=0`, `ShadowMode=true`, `ReadOnlyMode=true`, and
@@ -203,7 +204,8 @@ Generated agents:
 | `com.quantgod.usdjpy-history-sync` | Hourly USDJPY MT5 K-line sync into `runtime/backtest/usdjpy.sqlite` |
 | `com.quantgod.automation-chain` | Five-minute advisory-only automation chain with required-step result validation |
 | `com.quantgod.health-maintenance` | Minute-level local AgentOps/runtime health evidence refresh |
-| `com.quantgod.log-maintenance` | Hourly rotation for Backend `runtime/`, the active MT5 evidence root, and launchd logs, with explicit 32 MB active / 1024 MB archive caps |
+| `com.quantgod.log-maintenance` | Hourly rotation for Backend `runtime/`, the active MT5 evidence root, and launchd logs; each managed runtime has a 32 MiB active-log cap plus separate 512 MiB log-archive and 512 MiB JSONL-archive caps |
+| `com.quantgod.disk-maintenance` | Hourly bounded cleanup of allow-listed, regenerable QuantGod AI-history files and stale QuantGod status temporaries; never logs, archives, or general macOS/user data |
 | `com.quantgod.sqlite-backup` | Daily online SQLite backup followed by `quick_check`, SHA-256 verification, and retention of the latest 3 verified backup sets |
 | `com.quantgod.ai-telegram-monitor` | DeepSeek-assisted MT5 advisory push-only monitor |
 
@@ -214,6 +216,13 @@ invocation yet is `IDLE_PENDING`, and a non-zero last-exit code remains
 `FAILED`. This lifecycle classification does not override `runtimeStatus`,
 `observedHealth`, or `observedReadiness`; those fields continue to fail closed
 on stale, blocked, or failed evidence.
+
+Run one installed disk-maintenance cycle immediately, then inspect its status:
+
+```bash
+launchctl kickstart "gui/$(id -u)/com.quantgod.disk-maintenance"
+python3 scripts/qg-macos-launchd.py status
+```
 
 Private environment values live in `~/.quantgod/launchd.env`. Logs are written
 to `~/.quantgod/logs/`; capability and per-service runtime states are under
@@ -229,13 +238,46 @@ Log maintenance canonicalizes all three roots, rejects symlink components and
 root collisions, and de-duplicates Backend runtime versus active MT5 evidence
 when they resolve to the same directory. SQLite backup creates and validates the
 new set before pruning; only backup sets with verified identity are eligible for
-the keep-3 retention cleanup.
+the keep-3 retention cleanup. For every managed Backend or MT5 runtime, active
+logs are capped at 32 MiB, while its log archive and JSONL archive are each
+capped independently at 512 MiB. Launchd's own log root is maintained without a
+JSONL lane.
+
+Disk maintenance runs hourly and records its validated report at
+`~/.quantgod/status/QuantGod_DiskSpaceMaintenanceStatus.json`. It may delete
+only exact, old, regenerable artifacts under the canonical Backend runtime,
+active MT5 `MQL5/Files` runtime, and QuantGod private status/lock roots. Normal
+retention keeps 14 days and at least 500 AI-history records; disk-pressure
+retention keeps 3 days and at least 100, with per-run ceilings of 2048 MB and
+500 deleted files. Backend/MT5 `log_archive` and `jsonl_archive` trees are
+explicitly excluded: `com.quantgod.log-maintenance` is their sole owner, so the
+two hourly services cannot race while deleting the same files. Disk maintenance
+never cleans `~/Library/Caches`, Trash, Downloads, a whole MT5 Wine prefix,
+account configuration, Experts/Presets, SQLite stores, Git worktrees, or
+arbitrary user paths; inside the reviewed prefix, only exact allow-listed AI
+history and status-temporary artifacts are eligible. If allow-listed cleanup
+cannot reach the configured 12% free-space target, the task still exits cleanly
+but reports remaining pressure as observed health instead of expanding its
+deletion authority. The wrapper also rejects replayed reports: `generatedAtIso`
+and the report file mtime must belong to the current invocation and remain
+within the 7200-second validation window. The cleanup policy is checked against
+the report's pre-cleanup `appliedPressureLevel`, while final health is checked
+separately against the post-cleanup `pressureLevel`, `pressureActive`, and free
+percentage.
+
+Successful Frontend publication retains only the immediately previous verified
+`vue-dist` copy. This retention is managed independently by the publication
+tool and is not part of the disk runner's four deletion roots. A failed atomic
+promotion restores the active copy before any older completed backup is pruned.
 
 Uninstall:
 
 ```bash
 python3 scripts/qg-macos-launchd.py uninstall
 ```
+
+Uninstall removes the managed LaunchAgent definitions but preserves private
+logs, status reports, and verified backups under `~/.quantgod/`.
 
 ## Local Shadow Launch Policy
 
@@ -273,6 +315,22 @@ QG_USDJPY_HISTORY_SYNC_ENABLED=1
 QG_USDJPY_HISTORY_INTERVAL_SECONDS=3600
 QG_TELEGRAM_PUSH_ALLOWED=0
 QG_MT5_AI_DEEPSEEK_ENABLED=0
+QG_DISK_WARN_FREE_PERCENT=20
+QG_DISK_CRITICAL_FREE_PERCENT=10
+QG_DISK_TARGET_FREE_PERCENT=12
+QG_DISK_HISTORY_RETENTION_DAYS=14
+QG_DISK_PRESSURE_RETENTION_DAYS=3
+QG_DISK_HISTORY_KEEP=500
+QG_DISK_PRESSURE_HISTORY_KEEP=100
+QG_DISK_STALE_TEMP_HOURS=24
+QG_DISK_MAX_DELETE_MB_PER_RUN=2048
+QG_DISK_MAX_DELETE_FILES_PER_RUN=500
+QG_DISK_MAINTENANCE_FRESH_SECONDS=7200
+QG_DISK_MAINTENANCE_STATUS_FILE=~/.quantgod/status/QuantGod_DiskSpaceMaintenanceStatus.json
+QG_DISK_MAINTENANCE_LOCK_FILE=~/.quantgod/locks/disk-space-maintenance.lock
+QG_RUNTIME_LOG_MAX_MB=32
+QG_RUNTIME_LOG_ARCHIVE_MAX_MB=512
+QG_RUNTIME_JSONL_ARCHIVE_MAX_MB=512
 QG_USDJPY_HISTORY_MONTHS=12
 QG_USDJPY_HISTORY_TIMEFRAMES=M1,M5,M15,H1
 ```
@@ -324,3 +382,5 @@ Infra may start processes and synchronize static assets. It must not:
 - Add Telegram command execution.
 - Mutate tracked Shadow/ReadOnly preset safety settings.
 - Add any remote snapshot upload or public ingress path; this system is local-only.
+- Delete general macOS caches, Trash, Downloads, MT5 account/configuration
+  data, or files outside exact QuantGod maintenance roots.
